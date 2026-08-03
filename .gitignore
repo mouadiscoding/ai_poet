@@ -2,3 +2,4 @@
 .venv/
 # Environment Variables & Secrets
 .env
+data/
