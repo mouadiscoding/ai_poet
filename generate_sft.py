@@ -56,10 +56,22 @@ class PoemRecord:
 
     @property
     def couplet_count(self) -> int:
+        """Return the number of complete verse pairs stored in the record.
+
+        ``verses`` stores each hemistich as a separate item, with consecutive
+        items forming one couplet. Source validation guarantees an even number
+        of items, so the count is exactly half the sequence length.
+        """
         return len(self.verses) // 2
 
     @property
     def poem_text(self) -> str:
+        """Return the poem in the line-oriented format used by SFT prompts.
+
+        Each pair of hemistichs is joined with ``" = "``, and the resulting
+        couplets are separated by newlines. Formatting is delegated to
+        :func:`format_poem`, which also enforces the non-empty/even invariant.
+        """
         return format_poem(self.verses)
 
 
@@ -86,6 +98,17 @@ class GenerationError(RuntimeError):
 
 class GemmaClient:
     def __init__(self, settings: GenerationSettings) -> None:
+        """Create an API client from immutable generation settings.
+
+        The client retains all request defaults and builds one reusable TLS
+        context. Certificate verification is disabled only when the caller has
+        explicitly enabled ``settings.insecure``; otherwise the platform's
+        default trust configuration is used.
+
+        Args:
+            settings: Endpoint, authentication, sampling, timeout, retry, and
+                validation configuration for subsequent requests.
+        """
         self.settings = settings
         self.ssl_context = (
             ssl._create_unverified_context()  # noqa: SLF001 - explicit CLI opt-in
@@ -101,6 +124,34 @@ class GemmaClient:
         temperature: float | None = None,
         seed: int | None = None,
     ) -> str:
+        """Send a chat-completion request and return its generated text.
+
+        The method serializes an OpenAI-compatible request containing the
+        configured model and sampling values. Per-call token, temperature, and
+        seed values can override or augment those defaults. HTTP 429 and 5xx
+        responses, along with transport, timeout, decoding, and malformed
+        response errors, are retried with capped exponential backoff and
+        jitter. Other HTTP failures are reported immediately. The expected
+        response shape is ``choices[0].message.content``.
+
+        Args:
+            messages: Ordered chat messages. Each mapping must provide the
+                OpenAI-compatible ``role`` and ``content`` string fields.
+            max_tokens: Optional completion-token limit for this request. When
+                omitted, the configured default is used.
+            temperature: Optional sampling temperature for this request. When
+                omitted, the configured default is used.
+            seed: Optional deterministic sampling seed sent to endpoints that
+                support it.
+
+        Returns:
+            The first completion choice's message content, coerced to a string.
+
+        Raises:
+            GenerationError: If a non-retryable HTTP response is received or
+                every configured retry fails. Error text is sanitized so the
+                configured API key is not exposed.
+        """
         body: dict[str, Any] = {
             "model": self.settings.model,
             "messages": list(messages),
@@ -149,11 +200,39 @@ class GemmaClient:
 
 
 def poem_hash(verses: Sequence[str]) -> str:
+    """Compute a stable content identifier for an ordered verse sequence.
+
+    Hemistichs are joined with the Unicode record-separator symbol ``U+241E``
+    before hashing, which preserves item boundaries that ordinary string
+    concatenation would lose. The digest depends only on verse content and
+    order, not on metadata such as poet, title, URL, or meter.
+
+    Args:
+        verses: Hemistich strings in their original order.
+
+    Returns:
+        The lowercase hexadecimal SHA-256 digest of the joined UTF-8 text.
+    """
     joined = "\u241e".join(verses)
     return hashlib.sha256(joined.encode("utf-8")).hexdigest()
 
 
 def format_poem(verses: Sequence[str]) -> str:
+    """Format alternating hemistichs as newline-separated couplets.
+
+    Items at positions ``0`` and ``1`` form the first couplet, positions ``2``
+    and ``3`` form the second, and so on. The two sides are separated by
+    ``" = "`` to match the representation used in prompts and output records.
+
+    Args:
+        verses: A non-empty, even-length sequence of hemistich strings.
+
+    Returns:
+        A single string containing one formatted couplet per line.
+
+    Raises:
+        ValueError: If ``verses`` is empty or contains an odd number of items.
+    """
     if not verses or len(verses) % 2:
         raise ValueError("poem_verses must contain a non-empty even number of items")
     return "\n".join(
@@ -163,12 +242,42 @@ def format_poem(verses: Sequence[str]) -> str:
 
 
 def meter_name(meter_id: int) -> str:
+    """Resolve a numeric meter identifier to its canonical Arabic name.
+
+    Meter identifiers are zero-based indices into :data:`METER_NAMES`. Boolean
+    values technically satisfy Python's ``int`` check and therefore resolve as
+    indices in the same way as integers.
+
+    Args:
+        meter_id: Zero-based index of a supported poetic meter.
+
+    Returns:
+        The Arabic meter name at the requested index.
+
+    Raises:
+        ValueError: If the identifier is not an integer or lies outside the
+            configured meter-name table.
+    """
     if not isinstance(meter_id, int) or not 0 <= meter_id < len(METER_NAMES):
         raise ValueError(f"Unknown meter ID: {meter_id}")
     return METER_NAMES[meter_id]
 
 
 def _metadata_score(row: dict[str, Any], selected_meter: int) -> tuple[int, int]:
+    """Score a duplicate source row for selection as canonical metadata.
+
+    Rows using the majority meter receive highest priority. Within that group,
+    rows are ranked by how many of title, poet name, and poem URL are populated.
+    Returning a tuple lets Python compare these criteria lexicographically.
+
+    Args:
+        row: A source row containing poem metadata.
+        selected_meter: The meter chosen by majority vote for the poem group.
+
+    Returns:
+        ``(meter_matches, populated_field_count)``, where the first element is
+        either zero or one and the second ranges from zero to three.
+    """
     return (
         int(row["poem_meter"] == selected_meter),
         sum(bool(row.get(key)) for key in ("poem_title", "poet_name", "poem_url")),
@@ -176,6 +285,29 @@ def _metadata_score(row: dict[str, Any], selected_meter: int) -> tuple[int, int]
 
 
 def load_poems(path: Path) -> list[PoemRecord]:
+    """Load, validate, deduplicate, and canonicalize poems from Parquet.
+
+    Only the columns required for generation are read. Rows with identical
+    verse tuples are grouped as the same poem. Within each group, the meter is
+    selected by an unambiguous majority vote, and canonical descriptive
+    metadata comes from the best-populated row that uses that meter. All source
+    row indices and distinct non-empty URLs are retained for provenance. The
+    resulting sample identifier is based solely on the verses, and records are
+    sorted by their first source-row position to preserve source order.
+
+    Args:
+        path: Parquet dataset containing ``poem_title``, ``poem_meter``,
+            ``poem_verses``, ``poem_url``, and ``poet_name`` columns.
+
+    Returns:
+        One immutable :class:`PoemRecord` per distinct verse sequence.
+
+    Raises:
+        ValueError: If a row has no verses, has an odd number of hemistichs, a
+            duplicate group has a tied meter vote, or the selected meter ID is
+            unsupported.
+        OSError: If the source file cannot be read.
+    """
     columns = [
         "poem_title",
         "poem_meter",
@@ -232,6 +364,23 @@ def load_poems(path: Path) -> list[PoemRecord]:
 
 
 def sft_split(sample_id: str) -> str:
+    """Assign a sample deterministically to the train, validation, or test set.
+
+    The first eight hexadecimal digits of the content-derived sample ID are
+    mapped into one hundred buckets. Buckets 0--97 are training data, bucket 98
+    is validation data, and bucket 99 is test data, yielding a stable 98/1/1
+    allocation that does not depend on input ordering.
+
+    Args:
+        sample_id: Hexadecimal sample identifier, normally from
+            :func:`poem_hash`.
+
+    Returns:
+        ``"train"``, ``"validation"``, or ``"test"``.
+
+    Raises:
+        ValueError: If the first eight characters are not valid hexadecimal.
+    """
     bucket = int(sample_id[:8], 16) % 100
     if bucket < 98:
         return "train"
@@ -241,12 +390,49 @@ def sft_split(sample_id: str) -> str:
 
 
 def choose_family(poem: PoemRecord) -> TemplateFamily:
+    """Choose a deterministic prompt-template family for a poem.
+
+    Eligibility is determined by the poem's meter; notably, prose poems cannot
+    use the prosody-and-rhyme family. The next eight hexadecimal digits of the
+    sample ID select uniformly by modulo from the eligible tuple, so duplicate
+    content always receives the same template across runs.
+
+    Args:
+        poem: Canonical poem whose meter and sample ID drive selection.
+
+    Returns:
+        The selected :class:`~sft_templates.TemplateFamily`.
+
+    Raises:
+        ValueError: If the relevant sample-ID characters are not hexadecimal.
+    """
     families = eligible_families(poem.meter_name)
     offset = int(poem.sample_id[8:16], 16) % len(families)
     return families[offset]
 
 
 def split_poem_chunks(verses: Sequence[str], max_chars: int) -> list[str]:
+    """Partition a poem into size-limited chunks without splitting couplets.
+
+    Each adjacent hemistich pair is first formatted as ``left = right``. Lines
+    are accumulated until adding the next complete couplet, including its
+    separating newline, would exceed ``max_chars``. A single couplet longer
+    than the limit remains intact in its own oversized chunk because preserving
+    semantic and metrical pairs takes precedence over the character target.
+
+    Args:
+        verses: Alternating left and right hemistichs. Callers are expected to
+            supply a complete, even-length sequence.
+        max_chars: Maximum preferred character count per chunk.
+
+    Returns:
+        Formatted poem chunks in source order. An empty sequence produces an
+        empty list.
+
+    Raises:
+        ValueError: If ``max_chars`` is zero or negative.
+        IndexError: If ``verses`` contains an unmatched final hemistich.
+    """
     if max_chars <= 0:
         raise ValueError("max_chars must be positive")
     chunks: list[str] = []
@@ -267,6 +453,25 @@ def split_poem_chunks(verses: Sequence[str], max_chars: int) -> list[str]:
 
 
 def extract_json_object(raw: str) -> dict[str, Any]:
+    """Extract a top-level JSON object from a model response.
+
+    Leading or trailing Markdown JSON fences are stripped first. The cleaned
+    response is parsed as-is; if that fails, the substring spanning its first
+    opening brace through its last closing brace is parsed to tolerate prose or
+    other wrapper text around the object. Arrays and scalar JSON values are
+    rejected even when syntactically valid.
+
+    Args:
+        raw: Untrusted text returned by the generation endpoint.
+
+    Returns:
+        The decoded JSON object as a dictionary.
+
+    Raises:
+        ValueError: If no plausible object is present or the decoded top-level
+            value is not an object.
+        json.JSONDecodeError: If the selected object substring is invalid JSON.
+    """
     cleaned = CODE_FENCE_RE.sub("", raw.strip()).strip()
     try:
         value = json.loads(cleaned)
@@ -282,6 +487,19 @@ def extract_json_object(raw: str) -> dict[str, Any]:
 
 
 def _normalise_arabic(text: str) -> str:
+    """Reduce Arabic text to comparable base letters.
+
+    Arabic combining marks, Quranic annotation marks, and tatweel are removed,
+    followed by every character outside the Arabic Unicode block. The result is
+    intentionally aggressive: spaces and punctuation disappear so copied
+    hemistichs can be detected despite superficial formatting or diacritics.
+
+    Args:
+        text: Arbitrary text to normalize for containment checks.
+
+    Returns:
+        A compact string containing only normalized Arabic-block characters.
+    """
     text = DIACRITICS_RE.sub("", text)
     return re.sub(r"[^\u0600-\u06ff]", "", text)
 
@@ -289,6 +507,30 @@ def _normalise_arabic(text: str) -> str:
 def validate_generation(
     value: dict[str, Any], poem: PoemRecord, min_chars: int
 ) -> list[str]:
+    """Validate a generated instruction/reasoning object for SFT use.
+
+    Validation covers the exact two-key schema, string types, minimum lengths,
+    dominance of Arabic over Latin characters, explicit numeric couplet count,
+    and correct meter or prose terminology. It rejects mention of conflicting
+    meters and instructions that reproduce a complete sufficiently long source
+    hemistich after Arabic normalization. The reasoning must discuss semantics,
+    imagery or rhetoric, and revision; metered poems must also discuss prosody,
+    and every response must contain the final-result transition.
+
+    The function accumulates independent failures instead of raising, allowing
+    the caller to give the model a complete repair prompt. A schema type error
+    returns early because content checks require string fields.
+
+    Args:
+        value: Decoded model JSON to validate.
+        poem: Source poem providing the expected meter, count, and verse text.
+        min_chars: Minimum stripped length required independently for the
+            ``instruction`` and ``reasoning`` fields.
+
+    Returns:
+        Human-readable validation errors. An empty list means the generation
+        passed every rule.
+    """
     errors: list[str] = []
     if set(value) != {"instruction", "reasoning"}:
         errors.append("JSON must contain only instruction and reasoning")
@@ -344,7 +586,25 @@ def validate_generation(
 
 
 def compose_response(reasoning: str, poem: PoemRecord) -> str:
-    """Place editorial reasoning first and the exact source poem last."""
+    """Combine cleaned editorial reasoning with the exact source poem.
+
+    Any occurrence of the fully formatted poem is removed from the generated
+    reasoning. The cleanup also drops lines that exactly duplicate a source
+    couplet or hemistich, repeated final-result markers, and standalone headers
+    that would introduce a model-generated poem. Excess blank lines are
+    collapsed before one canonical Arabic final-result marker and the source
+    poem are appended verbatim. This guarantees that training targets end with
+    trusted source text rather than a potentially altered model reproduction.
+
+    Args:
+        reasoning: Model-generated editorial analysis, possibly containing
+            redundant poem text or result headings.
+        poem: Canonical source poem to append.
+
+    Returns:
+        The cleaned reasoning followed by ``النتيجة النهائية:`` and the
+        formatted source poem.
+    """
     marker = "النتيجة النهائية:"
     reasoning = reasoning.replace(poem.poem_text, "")
 
@@ -374,6 +634,28 @@ def compose_response(reasoning: str, poem: PoemRecord) -> str:
 
 
 def _chunk_analysis(client: GemmaClient, poem: PoemRecord, max_chars: int) -> str:
+    """Summarize a long poem chunk by chunk through the generation API.
+
+    The poem is divided on couplet boundaries, then each chunk is sent in its
+    own low-temperature Arabic analysis request. Requests identify the source
+    meter and the chunk's position, constrain the answer to meaning, imagery,
+    tone, and observable rhyme, and use a deterministic seed derived from the
+    poem ID plus the one-based chunk index. The ordered summaries provide a
+    compact substitute for source text that would exceed the main prompt limit.
+
+    Args:
+        client: Configured chat client used for every analysis request.
+        poem: Canonical poem to split and analyze.
+        max_chars: Preferred maximum size passed to :func:`split_poem_chunks`.
+
+    Returns:
+        The stripped summaries in source order, each prefixed with an Arabic
+        one-based chunk label and separated by a blank line.
+
+    Raises:
+        ValueError: If ``max_chars`` is not positive.
+        GenerationError: If any chunk request cannot be completed.
+    """
     summaries: list[str] = []
     chunks = split_poem_chunks(poem.verses, max_chars)
     for index, chunk in enumerate(chunks, start=1):
@@ -412,6 +694,34 @@ def generate_one(
     client: GemmaClient,
     settings: GenerationSettings,
 ) -> dict[str, Any]:
+    """Generate and validate one complete supervised fine-tuning record.
+
+    A prompt family is selected deterministically from the poem ID. Poems over
+    ``max_source_chars`` are summarized in chunks before prompt construction;
+    shorter poems are included verbatim. The model is asked for JSON containing
+    an instruction and editorial reasoning. Invalid JSON or content triggers up
+    to ``max_repairs`` follow-up attempts that include the previous answer and
+    all validation errors. Seeds are stable across runs and incremented for
+    each repair.
+
+    On success, the reasoning is cleaned and combined with the exact source
+    poem. The returned dictionary contains provenance, meter and template
+    metadata, a two-message SFT conversation, deterministic dataset split,
+    oversize/conflict flags, attempt count, and validation status.
+
+    Args:
+        poem: Canonical poem that supplies source text and metadata.
+        client: Chat-completion client used for analysis and generation calls.
+        settings: Prompt limits, repair count, and other generation settings.
+
+    Returns:
+        A JSON-serializable SFT record ready for checkpointing and export.
+
+    Raises:
+        GenerationError: If network generation fails or the response remains
+            invalid after the configured number of repair attempts.
+        ValueError: If chunk settings or poem formatting invariants are invalid.
+    """
     family = choose_family(poem)
     oversized = len(poem.poem_text) > settings.max_source_chars
     notes = (
@@ -491,6 +801,28 @@ def generate_one(
 
 
 def load_checkpoint(path: Path) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
+    """Replay an append-only generation checkpoint into current sample state.
+
+    Each non-blank JSONL event is processed in file order, so later events for
+    a sample replace earlier ones. A success stores its record and clears any
+    prior failure for that sample. A failure stores its message but deliberately
+    does not remove an already recorded success; callers ultimately give the
+    success mapping precedence when determining completed work.
+
+    Args:
+        path: Checkpoint JSONL path. A missing file is treated as an empty
+            checkpoint.
+
+    Returns:
+        A pair ``(successes, failures)`` keyed by sample ID. Successful values
+        are full SFT records; failure values are error strings.
+
+    Raises:
+        ValueError: If any non-blank line contains malformed JSON.
+        KeyError: If a decoded event lacks required ``sample_id``, ``status``,
+            or successful ``record`` fields.
+        OSError: If an existing checkpoint cannot be read.
+    """
     successes: dict[str, dict[str, Any]] = {}
     failures: dict[str, str] = {}
     if not path.exists():
@@ -515,6 +847,21 @@ def load_checkpoint(path: Path) -> tuple[dict[str, dict[str, Any]], dict[str, st
 
 
 def append_checkpoint(path: Path, event: dict[str, Any]) -> None:
+    """Append one durable JSON event to the generation checkpoint.
+
+    Parent directories are created as needed. The event is encoded as a single
+    UTF-8 JSON line with Arabic characters preserved, then the Python stream is
+    flushed so progress is visible to subsequent resume attempts even while a
+    larger corpus run is still active.
+
+    Args:
+        path: Destination JSONL checkpoint path.
+        event: JSON-serializable success or failure event.
+
+    Raises:
+        OSError: If directories or the checkpoint file cannot be written.
+        TypeError: If ``event`` contains values unsupported by ``json.dumps``.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8", newline="\n") as handle:
         handle.write(json.dumps(event, ensure_ascii=False) + "\n")
@@ -522,6 +869,20 @@ def append_checkpoint(path: Path, event: dict[str, Any]) -> None:
 
 
 def write_jsonl(path: Path, records: Iterable[dict[str, Any]]) -> None:
+    """Replace a UTF-8 JSONL file with serialized records.
+
+    Records are consumed lazily in iteration order. Each is written on exactly
+    one line with non-ASCII text preserved, making the result suitable for both
+    human inspection and streaming dataset readers.
+
+    Args:
+        path: Existing or new file to overwrite. Its parent must already exist.
+        records: Iterable of JSON-serializable dictionaries.
+
+    Raises:
+        OSError: If the destination cannot be opened or written.
+        TypeError: If a record is not JSON serializable.
+    """
     with path.open("w", encoding="utf-8", newline="\n") as handle:
         for record in records:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -535,6 +896,29 @@ def write_outputs(
     settings: GenerationSettings,
     source_fingerprint: str | None = None,
 ) -> None:
+    """Materialize generated records, failures, and a run manifest.
+
+    Successful records are ordered to match the canonical poem sequence and
+    written to JSONL; when at least one exists, the same records are also
+    written as a PyArrow Parquet table. Failures are sorted by sample ID and
+    exclude any sample that also has a success. The manifest reports completion
+    state, source and generated counts, model/request settings, optional source
+    digest, split and template distributions, and oversize/metadata-conflict
+    totals. The API key and retry controls are intentionally not exported.
+
+    Args:
+        output_dir: Directory in which dataset and manifest files are created.
+        poems: Full selected poem sequence, used for output ordering and
+            completeness calculations.
+        successes: Generated SFT records keyed by sample ID.
+        failures: Latest error text keyed by sample ID.
+        settings: Generation configuration to describe in the manifest.
+        source_fingerprint: Optional SHA-256 digest of the source dataset.
+
+    Raises:
+        OSError: If the output directory or any output file cannot be written.
+        TypeError: If records or manifest values cannot be serialized.
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
     ordered = [successes[poem.sample_id] for poem in poems if poem.sample_id in successes]
     write_jsonl(output_dir / "ashaar_sft.jsonl", ordered)
@@ -579,6 +963,17 @@ def write_outputs(
 
 
 def build_parser() -> ArgumentParser:
+    """Construct the command-line interface for dataset generation.
+
+    The parser exposes source/output paths, endpoint and model selection, the
+    environment-variable name holding the API key, TLS verification opt-out,
+    worker concurrency, network and repair limits, sampling settings, prompt
+    size thresholds, and an optional poem limit. Defaults describe the standard
+    local Ashaar generation run, but no arguments are parsed by this function.
+
+    Returns:
+        A configured :class:`argparse.ArgumentParser` ready to parse CLI input.
+    """
     parser = ArgumentParser(description=__doc__)
     parser.add_argument(
         "--input",
@@ -605,6 +1000,20 @@ def build_parser() -> ArgumentParser:
 
 
 def file_sha256(path: Path) -> str:
+    """Calculate the SHA-256 fingerprint of a file without loading it at once.
+
+    The file is streamed in one-megabyte binary blocks, so memory usage remains
+    bounded for large Parquet datasets.
+
+    Args:
+        path: File whose exact byte content should be hashed.
+
+    Returns:
+        The lowercase hexadecimal SHA-256 digest.
+
+    Raises:
+        OSError: If the file cannot be opened or read.
+    """
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         while block := handle.read(1024 * 1024):
@@ -613,6 +1022,25 @@ def file_sha256(path: Path) -> str:
 
 
 def _settings(args: Namespace) -> GenerationSettings:
+    """Convert parsed CLI arguments into validated generation settings.
+
+    The API key is looked up indirectly using ``args.api_key_env`` so secrets do
+    not need to appear on the command line. Concurrency is validated here even
+    though it belongs to run orchestration rather than the returned settings;
+    the remaining values are copied into an immutable
+    :class:`GenerationSettings` instance.
+
+    Args:
+        args: Namespace produced by :func:`build_parser`.
+
+    Returns:
+        Immutable settings for the client and generation pipeline.
+
+    Raises:
+        ValueError: If the named API-key environment variable is empty or
+            missing, or if concurrency is less than one.
+        AttributeError: If the namespace lacks an expected CLI attribute.
+    """
     api_key = os.environ.get(args.api_key_env)
     if not api_key:
         raise ValueError(
@@ -638,6 +1066,28 @@ def _settings(args: Namespace) -> GenerationSettings:
 
 
 def run(args: Namespace) -> int:
+    """Execute a resumable, concurrent SFT dataset generation run.
+
+    Source poems are loaded and optionally limited, then prior checkpoint events
+    are replayed and restricted to the current selection. Poems without a saved
+    success are submitted to a thread pool. Each finished task is immediately
+    checkpointed as a success or sanitized failure, allowing later invocations
+    to resume without regenerating completed samples. Individual generation
+    exceptions do not abort the corpus; final JSONL, Parquet, failure, and
+    manifest outputs are written after all pending tasks finish.
+
+    Args:
+        args: Parsed CLI namespace containing every option registered by
+            :func:`build_parser`.
+
+    Returns:
+        Zero when every selected poem has a successful record, otherwise one.
+
+    Raises:
+        ValueError: If configuration, the optional limit, or source poem data is
+            invalid.
+        OSError: If required input or output files cannot be accessed.
+    """
     settings = _settings(args)
     poems = load_poems(args.input)
     if args.limit is not None:
@@ -707,6 +1157,17 @@ def run(args: Namespace) -> int:
 
 
 def main() -> None:
+    """Parse CLI arguments, run generation, and terminate with a shell status.
+
+    Normal completion exits with the status returned by :func:`run`: zero for a
+    complete corpus and one for unresolved per-poem failures. Top-level
+    ``OSError`` and ``ValueError`` exceptions are rendered as concise messages
+    on standard error and converted to exit status two. Other unexpected
+    exceptions are allowed to propagate with their traceback.
+
+    Raises:
+        SystemExit: Always, with status zero, one, or two as described above.
+    """
     try:
         code = run(build_parser().parse_args())
     except (OSError, ValueError) as exc:

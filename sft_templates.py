@@ -206,6 +206,22 @@ SYSTEM_PROMPT = """أنت تبني بيانات تدريب إشرافي لشاع
 
 
 def family_by_id(template_id: str) -> TemplateFamily:
+    """Look up a prompt-template family by its stable identifier.
+
+    Families are searched in declaration order and the stored singleton object
+    is returned, preserving the canonical Arabic focus text associated with the
+    identifier.
+
+    Args:
+        template_id: Exact identifier from a :class:`TemplateFamily`, such as
+            ``"semantic_arc"``.
+
+    Returns:
+        The matching template-family definition.
+
+    Raises:
+        KeyError: If no configured family has ``template_id``.
+    """
     for family in TEMPLATE_FAMILIES:
         if family.template_id == template_id:
             return family
@@ -213,6 +229,20 @@ def family_by_id(template_id: str) -> TemplateFamily:
 
 
 def eligible_families(meter_name: str) -> tuple[TemplateFamily, ...]:
+    """Return the prompt families that may be used with a poetic meter.
+
+    Prose poetry (``النثر``) excludes the ``prosody_rhyme`` family because that
+    template assumes a classical meter. Every other meter receives the complete
+    family tuple. Unknown names are treated like metered poetry; validation of
+    meter vocabulary belongs to the dataset-loading layer.
+
+    Args:
+        meter_name: Canonical Arabic meter name or the prose marker ``النثر``.
+
+    Returns:
+        An ordered tuple of eligible families. For metered input this is the
+        shared :data:`TEMPLATE_FAMILIES` tuple; for prose it is a filtered tuple.
+    """
     if meter_name == "النثر":
         return tuple(
             family
@@ -225,6 +255,21 @@ def eligible_families(meter_name: str) -> tuple[TemplateFamily, ...]:
 def _example_user(
     example: FewShot, family: TemplateFamily | None = None
 ) -> str:
+    """Render the user half of one few-shot demonstration.
+
+    The prompt identifies the example's base meter and number of couplets or
+    prose units, then includes its reference poem verbatim. When a family is
+    supplied, its focus is appended as an additional demonstration constraint;
+    otherwise the example remains family-neutral.
+
+    Args:
+        example: Demonstration data containing meter, count, and source poem.
+        family: Optional template family whose Arabic focus should specialize
+            this example.
+
+    Returns:
+        An Arabic user message suitable for an OpenAI-compatible chat payload.
+    """
     prompt = (
         "ابنِ زوج تعليمات وتعليل من المرجع الآتي.\n"
         f"البحر الأساس: {example.meter_name}\n"
@@ -240,6 +285,27 @@ def _example_user(
 def _example_assistant(
     example: FewShot, family: TemplateFamily | None = None
 ) -> str:
+    """Serialize the assistant half of one few-shot demonstration as JSON.
+
+    The example's instruction and reasoning are copied before modification. If
+    a family is provided, the corresponding demonstration additions are
+    appended to the instruction and inserted into the reasoning immediately
+    before its last ``النتيجة النهائية:`` marker. If the marker is absent, the
+    reasoning addition is appended at the end. JSON serialization preserves
+    Arabic characters and emits exactly the ``instruction`` and ``reasoning``
+    keys expected from the model.
+
+    Args:
+        example: Base few-shot answer to serialize.
+        family: Optional family used to specialize both generated fields.
+
+    Returns:
+        A JSON object encoded as a string for use as an assistant chat message.
+
+    Raises:
+        KeyError: If ``family.template_id`` has no entry in
+            :data:`FAMILY_DEMO_ADDITIONS`.
+    """
     instruction = example.instruction
     reasoning = example.reasoning
     if family is not None:
@@ -274,7 +340,41 @@ def build_messages(
     minimum_chars: int,
     analysis_notes: str | None = None,
 ) -> list[dict[str, str]]:
-    """Build a true multi-message few-shot conversation for Gemma."""
+    """Build the complete few-shot chat conversation for one source poem.
+
+    The conversation begins with the Arabic system policy formatted with the
+    requested minimum field length and selected family focus. It then adds two
+    paired demonstrations chosen from the prose or metered example bank. The
+    second demonstration is specialized to the requested family so the model
+    sees both a general pattern and a focus-specific pattern. A final user
+    message supplies the actual meter, explicit numeric couplet/unit count, and
+    source material, then reiterates the JSON-only response contract.
+
+    For ordinary poems, ``poem_text`` is embedded verbatim. For long poems,
+    non-``None`` ``analysis_notes`` take precedence and are presented as ordered
+    summaries from which the model must infer a single poem-wide instruction
+    and reasoning pair. The function performs prompt assembly only; it does not
+    call the model or validate the eventual response.
+
+    Args:
+        family: Template family controlling the system focus and specialized
+            second demonstration.
+        meter_name: Canonical Arabic source meter, or ``النثر`` for prose.
+        couplet_count: Exact number the generated instruction must state.
+        poem_text: Formatted source poem for the normal prompt path. It may be
+            ``None`` when ``analysis_notes`` is provided.
+        minimum_chars: Minimum length interpolated into the system requirements
+            for each generated JSON field.
+        analysis_notes: Optional ordered summaries used instead of full source
+            text for an oversized poem.
+
+    Returns:
+        Ordered OpenAI-compatible message dictionaries, beginning with one
+        system message and ending with the real user task.
+
+    Raises:
+        KeyError: If the selected family lacks demonstration additions.
+    """
     examples = PROSE_FEW_SHOTS if meter_name == "النثر" else METERED_FEW_SHOTS
     messages: list[dict[str, str]] = [
         {
