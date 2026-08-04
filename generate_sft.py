@@ -24,6 +24,7 @@ from uuid import uuid4
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+from dotenv import load_dotenv
 
 from sft_templates import (
     METER_NAMES,
@@ -34,10 +35,6 @@ from sft_templates import (
 )
 
 
-DEFAULT_ENDPOINT = (
-    "https://vllm-gemma4-31b-mtrna-ns1.apps.olympus.atlasxai.ma/"
-    "v1/chat/completions"
-)
 ARABIC_RE = re.compile(r"[\u0600-\u06ff]")
 LATIN_RE = re.compile(r"[A-Za-z]")
 DIACRITICS_RE = re.compile(r"[\u0610-\u061a\u064b-\u065f\u0670\u06d6-\u06edـ]")
@@ -1189,10 +1186,9 @@ def write_outputs(
 def build_parser() -> ArgumentParser:
     """Construct the command-line interface for dataset generation.
 
-    The parser exposes source/output paths, endpoint and model selection, the
-    environment-variable name holding the API key, TLS verification opt-out,
-    worker concurrency, network and repair limits, sampling settings, prompt
-    size thresholds, an optional poem limit, and full audit tracing. Defaults
+    The parser exposes source/output paths, TLS verification opt-out, worker
+    concurrency, network and repair limits, sampling settings, prompt size
+    thresholds, an optional poem limit, and full audit tracing. Defaults
     describe the standard local Ashaar generation run, but no arguments are
     parsed by this function.
 
@@ -1206,9 +1202,6 @@ def build_parser() -> ArgumentParser:
         default=Path("data/ashaar_classic_moroccan.parquet"),
     )
     parser.add_argument("--output-dir", type=Path, default=Path("data/ashaar_sft"))
-    parser.add_argument("--endpoint", default=DEFAULT_ENDPOINT)
-    parser.add_argument("--model", default="gemma-4-31B")
-    parser.add_argument("--api-key-env", default="GEMMA_API_KEY")
     parser.add_argument("--insecure", action="store_true")
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--timeout", type=float, default=300.0)
@@ -1257,11 +1250,12 @@ def file_sha256(path: Path) -> str:
 def _settings(args: Namespace) -> GenerationSettings:
     """Convert parsed CLI arguments into validated generation settings.
 
-    The API key is looked up indirectly using ``args.api_key_env`` so secrets do
-    not need to appear on the command line. Concurrency is validated here even
-    though it belongs to run orchestration rather than the returned settings;
-    the remaining values are copied into an immutable
-    :class:`GenerationSettings` instance.
+    The endpoint, model, and API key are loaded from ``.env`` so they do not
+    need to appear in source code or on the command line. Existing
+    process-environment values take precedence over values in the file.
+    Concurrency is validated here even though it belongs to run orchestration
+    rather than the returned settings; the remaining values are copied into an
+    immutable :class:`GenerationSettings` instance.
 
     Args:
         args: Namespace produced by :func:`build_parser`.
@@ -1270,20 +1264,32 @@ def _settings(args: Namespace) -> GenerationSettings:
         Immutable settings for the client and generation pipeline.
 
     Raises:
-        ValueError: If the named API-key environment variable is empty or
-            missing, or if concurrency is less than one.
+        ValueError: If ``GEMMA_ENDPOINT``, ``GEMMA_MODEL``, or
+            ``GEMMA_API_KEY`` is empty or missing, or if concurrency is less
+            than one.
         AttributeError: If the namespace lacks an expected CLI attribute.
     """
-    api_key = os.environ.get(args.api_key_env)
+    load_dotenv()
+    endpoint = os.environ.get("GEMMA_ENDPOINT")
+    if not endpoint:
+        raise ValueError(
+            "GEMMA_ENDPOINT must be set in .env or the process environment"
+        )
+    model = os.environ.get("GEMMA_MODEL")
+    if not model:
+        raise ValueError(
+            "GEMMA_MODEL must be set in .env or the process environment"
+        )
+    api_key = os.environ.get("GEMMA_API_KEY")
     if not api_key:
         raise ValueError(
-            f"Environment variable {args.api_key_env} must contain the API key"
+            "GEMMA_API_KEY must be set in .env or the process environment"
         )
     if args.concurrency < 1:
         raise ValueError("--concurrency must be at least 1")
     return GenerationSettings(
-        endpoint=args.endpoint,
-        model=args.model,
+        endpoint=endpoint,
+        model=model,
         api_key=api_key,
         insecure=args.insecure,
         timeout=args.timeout,

@@ -28,6 +28,8 @@ from generate_sft import (
     split_poem_chunks,
     validate_generation,
     write_outputs,
+    _settings,
+    build_parser,
 )
 from sft_templates import TEMPLATE_FAMILIES, build_messages, eligible_families
 
@@ -96,6 +98,50 @@ class QueueClient:
         if not self.outputs:
             raise AssertionError("unexpected client call")
         return self.outputs.pop(0)
+
+
+class ConfigurationTests(unittest.TestCase):
+    def test_settings_load_required_values_from_dotenv(self) -> None:
+        args = build_parser().parse_args([])
+        environment = {
+            "GEMMA_ENDPOINT": "https://env.example/v1/chat/completions",
+            "GEMMA_MODEL": "env-model",
+            "GEMMA_API_KEY": "env-secret",
+        }
+
+        with (
+            patch("generate_sft.load_dotenv") as load_dotenv,
+            patch.dict("os.environ", environment, clear=True),
+        ):
+            result = _settings(args)
+
+        load_dotenv.assert_called_once_with()
+        self.assertEqual(result.endpoint, environment["GEMMA_ENDPOINT"])
+        self.assertEqual(result.model, environment["GEMMA_MODEL"])
+        self.assertEqual(result.api_key, environment["GEMMA_API_KEY"])
+
+    def test_settings_require_every_dotenv_value(self) -> None:
+        args = build_parser().parse_args([])
+        environment = {
+            "GEMMA_ENDPOINT": "https://env.example/v1/chat/completions",
+            "GEMMA_MODEL": "env-model",
+            "GEMMA_API_KEY": "env-secret",
+        }
+
+        for missing_name in environment:
+            with self.subTest(missing_name=missing_name):
+                incomplete = environment | {missing_name: ""}
+                with (
+                    patch("generate_sft.load_dotenv"),
+                    patch.dict("os.environ", incomplete, clear=True),
+                    self.assertRaisesRegex(ValueError, missing_name),
+                ):
+                    _settings(args)
+
+    def test_parser_has_no_endpoint_or_model_override(self) -> None:
+        help_text = build_parser().format_help()
+        self.assertNotIn("--endpoint", help_text)
+        self.assertNotIn("--model", help_text)
 
 
 def settings(**overrides) -> GenerationSettings:

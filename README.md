@@ -17,16 +17,23 @@ operational details.
 ## Security first
 
 Never put an API key in the repository or command line. Revoke any key that has
-been pasted into chat, shell history, or logs, create a replacement, and expose
-the replacement only through an environment variable:
+been pasted into chat, shell history, or logs, then create a local `.env` from
+the committed example and fill in all three required values:
 
 ```powershell
-$env:GEMMA_API_KEY="replace-with-a-new-token"
+Copy-Item .env_example .env
 ```
 
-The client verifies TLS certificates by default. The internal endpoint shown
-below may require `--insecure`, which is equivalent to `curl -k`; use that flag
-only for an endpoint you trust.
+```dotenv
+GEMMA_ENDPOINT=https://your-host.example/v1/chat/completions
+GEMMA_MODEL=your-model-name
+GEMMA_API_KEY=replace-with-a-new-token
+```
+
+The client verifies TLS certificates by default. An internal endpoint may
+require `--insecure`, which is equivalent to `curl -k`; use that flag only for
+an endpoint you trust. Process-environment values override matching `.env`
+values.
 
 ## Generate a smoke sample
 
@@ -60,12 +67,8 @@ uv run python generate_sft.py `
   --insecure
 ```
 
-The endpoint and model default to:
-
-- `https://vllm-gemma4-31b-mtrna-ns1.apps.olympus.atlasxai.ma/v1/chat/completions`
-- `gemma-4-31B`
-
-Use `--endpoint` or `--model` to override them. Run
+The endpoint and model are required in `.env`; neither has a default embedded
+in the code. Run
 `uv run python generate_sft.py --help` for generation, validation, retry, and
 context-size controls.
 

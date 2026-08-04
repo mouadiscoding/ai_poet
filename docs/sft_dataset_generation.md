@@ -12,8 +12,8 @@ containing:
 2. A long Arabic editorial reasoning section.
 3. The exact source poem as the final answer.
 
-The generator uses the `gemma-4-31B` chat-completions endpoint to infer the
-subject, meaning progression, imagery, emotional atmosphere, diction, rhyme,
+The generator uses the configured chat-completions endpoint and model to infer
+the subject, meaning progression, imagery, emotional atmosphere, diction, rhyme,
 and other constraints from each source poem. It does not ask Gemma to reproduce
 the final target. The Python code appends the original poem itself so that model
 copying errors cannot corrupt the SFT answer.
@@ -239,39 +239,14 @@ oversized_for_sft = true
 This flag is important: retaining every poem in the master dataset does not
 mean every row fits the context length of a downstream training model.
 
-## API client and generation settings
-
-The default endpoint is:
-
-```text
-https://vllm-gemma4-31b-mtrna-ns1.apps.olympus.atlasxai.ma/v1/chat/completions
-```
-
-The default model and decoding settings are:
-
-| Setting | Default |
-| --- | --- |
-| Model | `gemma-4-31B` |
-| Concurrent poems | 4 |
-| Temperature | 0.4 |
-| Top-p | 0.9 |
-| Maximum output tokens | 4,096 |
-| Minimum instruction characters | 1,500 |
-| Minimum reasoning characters | 1,500 |
-| Request timeout | 300 seconds |
-| Network attempts | 5 |
-| Semantic repair calls | 2 |
-
-A seed derived from the poem hash makes the sampling request stable for the
-same poem and repair attempt, assuming the server supports the OpenAI-compatible
-`seed` field.
-
 ### Authentication and TLS
 
-The API key is read only from an environment variable. By default that variable
-is `GEMMA_API_KEY`; `--api-key-env` can select another name. The key is never
-written to checkpoints, output records, manifests, or logs. Errors are scrubbed
-if the key somehow appears in their text.
+The endpoint, model, and API key are loaded from `.env` as `GEMMA_ENDPOINT`,
+`GEMMA_MODEL`, and `GEMMA_API_KEY`. All three values are required, and there are
+no endpoint or model defaults in the source code. Existing process-environment
+values take precedence over the file. The key is never written to checkpoints,
+output records, manifests, or logs. Errors are scrubbed if the key somehow
+appears in their text.
 
 TLS certificate verification is enabled by default. `--insecure` explicitly
 creates an unverified TLS context and is equivalent to `curl -k`. It should be
@@ -449,10 +424,17 @@ enabled, its `run_id`, and the sidecar filename.
 
 ## Running the pipeline
 
-Create a new API token and expose it only through the environment:
+Create a local `.env` from the committed example, then set the endpoint, model,
+and a new API token in that file:
 
 ```powershell
-$env:GEMMA_API_KEY="replace-with-a-new-token"
+Copy-Item .env_example .env
+```
+
+```dotenv
+GEMMA_ENDPOINT=https://your-host.example/v1/chat/completions
+GEMMA_MODEL=your-model-name
+GEMMA_API_KEY=replace-with-a-new-token
 ```
 
 Run a ten-poem inspection sample first:
