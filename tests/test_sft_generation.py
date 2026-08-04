@@ -15,6 +15,7 @@ from generate_sft import (
     GenerationSettings,
     GenerationTracer,
     PoemRecord,
+    append_jsonl,
     choose_family,
     compose_response,
     extract_json_object,
@@ -24,6 +25,7 @@ from generate_sft import (
     load_poems,
     meter_name,
     poem_hash,
+    run,
     sft_split,
     split_poem_chunks,
     validate_generation,
@@ -464,6 +466,51 @@ class PipelineTests(unittest.TestCase):
             self.assertFalse(manifest["trace"]["enabled"])
         finally:
             remove_test_files(*generated_files)
+
+    def test_append_jsonl_makes_each_record_visible(self) -> None:
+        path = TEST_TMP / "live_sft.jsonl"
+        remove_test_files(path.name)
+        self.addCleanup(remove_test_files, path.name)
+
+        append_jsonl(path, {"sample_id": "first"})
+        self.assertEqual(
+            [json.loads(line) for line in path.read_text("utf-8").splitlines()],
+            [{"sample_id": "first"}],
+        )
+
+        append_jsonl(path, {"sample_id": "second"})
+        self.assertEqual(
+            [json.loads(line) for line in path.read_text("utf-8").splitlines()],
+            [{"sample_id": "first"}, {"sample_id": "second"}],
+        )
+
+    def test_run_publishes_sft_record_before_final_export(self) -> None:
+        poem = make_poem()
+        record = generate_one(
+            poem,
+            QueueClient([json.dumps(valid_value(poem), ensure_ascii=False)]),
+            settings(),
+        )
+        generated_files = ("generation_checkpoint.jsonl", "ashaar_sft.jsonl")
+        remove_test_files(*generated_files)
+        self.addCleanup(remove_test_files, *generated_files)
+        args = build_parser().parse_args(
+            ["--input", str(TEST_TMP / "source.parquet"), "--output-dir", str(TEST_TMP)]
+        )
+
+        def assert_live_jsonl(*_args, **_kwargs) -> None:
+            lines = (TEST_TMP / "ashaar_sft.jsonl").read_text("utf-8").splitlines()
+            self.assertEqual([json.loads(line) for line in lines], [record])
+
+        with (
+            patch("generate_sft._settings", return_value=settings()),
+            patch("generate_sft.load_poems", return_value=[poem]),
+            patch("generate_sft.file_sha256", return_value="source-digest"),
+            patch("generate_sft.generate_one", return_value=record),
+            patch("generate_sft.write_outputs", side_effect=assert_live_jsonl),
+            redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(run(args), 0)
 
 
 if __name__ == "__main__":

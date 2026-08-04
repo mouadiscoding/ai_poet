@@ -80,6 +80,10 @@ sample IDs and retries unresolved failures. Transient HTTP failures are retried
 up to five times; structurally or semantically invalid model responses receive
 up to two repair prompts.
 
+Each successful record is also appended and flushed immediately to
+`ashaar_sft.jsonl`, so the training data can be inspected while generation is
+still running. The file is rewritten in source order when the run finishes.
+
 The run returns a non-zero exit status while any selected poem remains
 unresolved. `failures.jsonl` records those failures without storing request
 headers or credentials.

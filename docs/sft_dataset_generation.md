@@ -342,8 +342,10 @@ skipped. Failed or missing IDs are submitted again. A later success supersedes
 an earlier failure.
 
 Checkpoint events are written by the main thread after each concurrent task
-finishes, so individual JSON lines are not interleaved. Final records are sorted
-back into source order, independent of request completion order.
+finishes, so individual JSON lines are not interleaved. Each successful SFT
+record is then appended and flushed to `ashaar_sft.jsonl`, making it visible
+while generation continues. During a run, newly generated records appear in
+completion order; when the run finishes, the file is rewritten in source order.
 
 When `--limit` is used, checkpoint entries outside the selected prefix are
 ignored for that run. The command returns exit code 1 while any selected sample

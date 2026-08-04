@@ -1102,6 +1102,13 @@ def write_jsonl(path: Path, records: Iterable[dict[str, Any]]) -> None:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
+def append_jsonl(path: Path, record: dict[str, Any]) -> None:
+    """Append and immediately flush one UTF-8 JSONL record."""
+    with path.open("a", encoding="utf-8", newline="\n") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        handle.flush()
+
+
 def write_outputs(
     output_dir: Path,
     poems: Sequence[PoemRecord],
@@ -1312,8 +1319,9 @@ def run(args: Namespace) -> int:
     success are submitted to a thread pool. Each finished task is immediately
     checkpointed as a success or sanitized failure, allowing later invocations
     to resume without regenerating completed samples. Individual generation
-    exceptions do not abort the corpus; final JSONL, Parquet, failure, and
-    manifest outputs are written after all pending tasks finish.
+    exceptions do not abort the corpus. Successful records are flushed to the
+    SFT JSONL file as each task finishes; final ordered JSONL, Parquet, failure,
+    and manifest outputs are written after all pending tasks finish.
 
     Args:
         args: Parsed CLI namespace containing every option registered by
@@ -1349,6 +1357,15 @@ def run(args: Namespace) -> int:
         if sample_id in selected_ids and sample_id not in successes
     }
     pending = [poem for poem in poems if poem.sample_id not in successes]
+    sft_jsonl = args.output_dir / "ashaar_sft.jsonl"
+    write_jsonl(
+        sft_jsonl,
+        (
+            successes[poem.sample_id]
+            for poem in poems
+            if poem.sample_id in successes
+        ),
+    )
     source_fingerprint = file_sha256(args.input)
     tracer = (
         GenerationTracer(
@@ -1440,6 +1457,8 @@ def run(args: Namespace) -> int:
                         }
                     )
             append_checkpoint(checkpoint, event)
+            if status == "ok":
+                append_jsonl(sft_jsonl, record)
             with PRINT_LOCK:
                 print(f"[{completed}/{len(poems)}] {poem.sample_id[:12]} {status}")
 
