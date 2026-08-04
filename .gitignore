@@ -2,6 +2,8 @@
 .venv/
 __pycache__/
 *.py[cod]
+.uv-cache/
 # Environment Variables & Secrets
 .env
+# Generated Data
 data/
