@@ -6,6 +6,7 @@ from argparse import ArgumentParser, Namespace
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -19,12 +20,14 @@ import time
 from typing import Any, Iterable, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+from uuid import uuid4
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 
 from sft_templates import (
     METER_NAMES,
+    TEMPLATE_FAMILIES,
     TemplateFamily,
     build_messages,
     eligible_families,
@@ -40,6 +43,11 @@ LATIN_RE = re.compile(r"[A-Za-z]")
 DIACRITICS_RE = re.compile(r"[\u0610-\u061a\u064b-\u065f\u0670\u06d6-\u06edـ]")
 CODE_FENCE_RE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", re.IGNORECASE)
 PRINT_LOCK = threading.Lock()
+TEMPLATE_RATIONALE = (
+    "Meta-template families diversify the reverse-generated instructions while "
+    "keeping the shared poetry constraints fixed. Selection is deterministic "
+    "from the poem hash so it is reproducible and approximately balanced."
+)
 
 
 @dataclass(frozen=True)
@@ -92,12 +100,61 @@ class GenerationSettings:
     chunk_chars: int
 
 
+def _redact(value: Any, secrets: Sequence[str]) -> Any:
+    """Recursively replace configured secrets in a JSON-compatible value."""
+    if isinstance(value, str):
+        for secret in secrets:
+            if secret:
+                value = value.replace(secret, "[REDACTED]")
+        return value
+    if isinstance(value, dict):
+        return {key: _redact(item, secrets) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_redact(item, secrets) for item in value]
+    return value
+
+
+class GenerationTracer:
+    """Write full, secret-scrubbed generation events to JSONL and stdout."""
+
+    def __init__(self, path: Path, *, secrets: Sequence[str] = ()) -> None:
+        self.path = path
+        self.run_id = uuid4().hex
+        self.secrets = tuple(secret for secret in secrets if secret)
+
+    def emit(self, event: dict[str, Any]) -> None:
+        record = _redact(
+            {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "run_id": self.run_id,
+                **event,
+            },
+            self.secrets,
+        )
+        serialized = json.dumps(record, ensure_ascii=False)
+        rendered = json.dumps(record, ensure_ascii=False, indent=2)
+        label = str(record.get("event", "event"))
+        sample_id = record.get("sample_id")
+        if sample_id:
+            label += f" sample={str(sample_id)[:12]}"
+        with PRINT_LOCK:
+            with self.path.open("a", encoding="utf-8") as handle:
+                handle.write(serialized + "\n")
+            print(f"\n=== SFT TRACE {label} ===")
+            print(rendered)
+            print("=== END SFT TRACE ===", flush=True)
+
+
 class GenerationError(RuntimeError):
     pass
 
 
 class GemmaClient:
-    def __init__(self, settings: GenerationSettings) -> None:
+    def __init__(
+        self,
+        settings: GenerationSettings,
+        tracer: GenerationTracer | None = None,
+    ) -> None:
         """Create an API client from immutable generation settings.
 
         The client retains all request defaults and builds one reusable TLS
@@ -108,8 +165,10 @@ class GemmaClient:
         Args:
             settings: Endpoint, authentication, sampling, timeout, retry, and
                 validation configuration for subsequent requests.
+            tracer: Optional audit writer for complete request/response events.
         """
         self.settings = settings
+        self.tracer = tracer
         self.ssl_context = (
             ssl._create_unverified_context()  # noqa: SLF001 - explicit CLI opt-in
             if settings.insecure
@@ -123,6 +182,7 @@ class GemmaClient:
         max_tokens: int | None = None,
         temperature: float | None = None,
         seed: int | None = None,
+        trace_context: dict[str, Any] | None = None,
     ) -> str:
         """Send a chat-completion request and return its generated text.
 
@@ -143,6 +203,8 @@ class GemmaClient:
                 omitted, the configured default is used.
             seed: Optional deterministic sampling seed sent to endpoints that
                 support it.
+            trace_context: Optional sample and attempt fields to merge into the
+                audit event. Request headers are never included.
 
         Returns:
             The first completion choice's message content, coerced to a string.
@@ -175,6 +237,8 @@ class GemmaClient:
             },
         )
 
+        started = time.perf_counter()
+        retry_errors: list[dict[str, Any]] = []
         for attempt in range(self.settings.max_network_retries):
             try:
                 with urlopen(  # noqa: S310 - user-configured HTTPS endpoint
@@ -183,20 +247,76 @@ class GemmaClient:
                     context=self.ssl_context,
                 ) as response:
                     payload = json.loads(response.read().decode("utf-8"))
-                return str(payload["choices"][0]["message"]["content"])
+                content = str(payload["choices"][0]["message"]["content"])
             except HTTPError as exc:
                 retryable = exc.code == 429 or exc.code >= 500
+                retry_errors.append(
+                    {
+                        "network_attempt": attempt + 1,
+                        "error_type": type(exc).__name__,
+                        "http_status": exc.code,
+                        "retryable": retryable,
+                    }
+                )
                 if not retryable or attempt + 1 == self.settings.max_network_retries:
+                    self._trace_api_failure(
+                        body, trace_context, attempt + 1, retry_errors, started
+                    )
                     raise GenerationError(f"API returned HTTP {exc.code}") from exc
             except (URLError, TimeoutError, OSError, KeyError, ValueError) as exc:
+                safe_error = str(exc).replace(self.settings.api_key, "[REDACTED]")
+                retry_errors.append(
+                    {
+                        "network_attempt": attempt + 1,
+                        "error_type": type(exc).__name__,
+                        "message": safe_error,
+                        "retryable": True,
+                    }
+                )
                 if attempt + 1 == self.settings.max_network_retries:
-                    safe_error = str(exc).replace(
-                        self.settings.api_key, "[REDACTED]"
+                    self._trace_api_failure(
+                        body, trace_context, attempt + 1, retry_errors, started
                     )
                     raise GenerationError(f"API request failed: {safe_error}") from exc
+            else:
+                if self.tracer is not None:
+                    self.tracer.emit(
+                        {
+                            "event": "api_exchange",
+                            **(trace_context or {}),
+                            "endpoint": self.settings.endpoint,
+                            "request": body,
+                            "response": payload,
+                            "network_attempts": attempt + 1,
+                            "retry_errors": retry_errors,
+                            "elapsed_seconds": round(time.perf_counter() - started, 3),
+                        }
+                    )
+                return content
             delay = min(2**attempt, 16) + random.random()
             time.sleep(delay)
         raise AssertionError("network retry loop terminated unexpectedly")
+
+    def _trace_api_failure(
+        self,
+        body: dict[str, Any],
+        trace_context: dict[str, Any] | None,
+        network_attempts: int,
+        retry_errors: list[dict[str, Any]],
+        started: float,
+    ) -> None:
+        if self.tracer is not None:
+            self.tracer.emit(
+                {
+                    "event": "api_failure",
+                    **(trace_context or {}),
+                    "endpoint": self.settings.endpoint,
+                    "request": body,
+                    "network_attempts": network_attempts,
+                    "retry_errors": retry_errors,
+                    "elapsed_seconds": round(time.perf_counter() - started, 3),
+                }
+            )
 
 
 def poem_hash(verses: Sequence[str]) -> str:
@@ -409,6 +529,12 @@ def choose_family(poem: PoemRecord) -> TemplateFamily:
     families = eligible_families(poem.meter_name)
     offset = int(poem.sample_id[8:16], 16) % len(families)
     return families[offset]
+
+
+def _emit_client_trace(client: Any, event: dict[str, Any]) -> None:
+    tracer = getattr(client, "tracer", None)
+    if tracer is not None:
+        tracer.emit(event)
 
 
 def split_poem_chunks(verses: Sequence[str], max_chars: int) -> list[str]:
@@ -681,6 +807,12 @@ def _chunk_analysis(client: GemmaClient, poem: PoemRecord, max_chars: int) -> st
                 max_tokens=800,
                 temperature=0.2,
                 seed=int(poem.sample_id[:8], 16) + index,
+                trace_context={
+                    "sample_id": poem.sample_id,
+                    "request_kind": "chunk_analysis",
+                    "chunk_index": index,
+                    "chunk_count": len(chunks),
+                },
             ).strip()
         )
     return "\n\n".join(
@@ -723,6 +855,37 @@ def generate_one(
         ValueError: If chunk settings or poem formatting invariants are invalid.
     """
     family = choose_family(poem)
+    families = eligible_families(poem.meter_name)
+    selector_hex = poem.sample_id[8:16]
+    selected_index = int(selector_hex, 16) % len(families)
+    _emit_client_trace(
+        client,
+        {
+            "event": "template_selection",
+            "sample_id": poem.sample_id,
+            "source_row_indices": list(poem.source_row_indices),
+            "poet_name": poem.poet_name,
+            "poem_title": poem.poem_title,
+            "meter_name": poem.meter_name,
+            "couplet_count": poem.couplet_count,
+            "source_characters": len(poem.poem_text),
+            "eligible_template_ids": [item.template_id for item in families],
+            "selected_template_id": family.template_id,
+            "selected_template_focus": family.focus,
+            "why_used": {
+                "purpose": TEMPLATE_RATIONALE,
+                "eligibility": (
+                    "prosody_rhyme is excluded because this is prose poetry"
+                    if poem.meter_name == "النثر"
+                    else "all template families are eligible for a metered poem"
+                ),
+                "selection": (
+                    f"int(sample_id[8:16], 16) % {len(families)} = "
+                    f"int('{selector_hex}', 16) % {len(families)} = {selected_index}"
+                ),
+            },
+        },
+    )
     oversized = len(poem.poem_text) > settings.max_source_chars
     notes = (
         _chunk_analysis(client, poem, settings.chunk_chars) if oversized else None
@@ -759,18 +922,56 @@ def generate_one(
             )
         else:
             repair_messages = messages
-        raw = client.chat(repair_messages, seed=seed + repair)
+        raw = client.chat(
+            repair_messages,
+            seed=seed + repair,
+            trace_context={
+                "sample_id": poem.sample_id,
+                "request_kind": "initial_generation" if repair == 0 else "repair",
+                "generation_attempt": attempts,
+                "repair_index": repair,
+                "template_id": family.template_id,
+            },
+        )
         try:
             value = extract_json_object(raw)
             errors = validate_generation(value, poem, settings.min_chars)
         except (ValueError, json.JSONDecodeError) as exc:
             value = {}
             errors = [str(exc)]
+        _emit_client_trace(
+            client,
+            {
+                "event": "validation_result",
+                "sample_id": poem.sample_id,
+                "generation_attempt": attempts,
+                "raw_model_content": raw,
+                "parsed_output": value,
+                "passed": not errors,
+                "validation_errors": errors,
+            },
+        )
         if not errors:
             instruction = str(value["instruction"]).strip()
             reasoning = str(value["reasoning"]).strip()
             response = compose_response(reasoning, poem)
-            return {
+            source_lines = {
+                line.strip() for line in poem.poem_text.splitlines() if line.strip()
+            }
+            source_lines.update(verse.strip() for verse in poem.verses if verse.strip())
+            marker = "النتيجة النهائية:"
+            postprocessing = {
+                "full_poem_occurrences_removed": reasoning.count(poem.poem_text),
+                "source_lines_removed": sum(
+                    line.strip() in source_lines for line in reasoning.splitlines()
+                ),
+                "result_marker_lines_removed": sum(
+                    line.strip().startswith(marker) for line in reasoning.splitlines()
+                ),
+                "canonical_result_marker_added": True,
+                "exact_source_poem_appended": True,
+            }
+            record = {
                 "sample_id": poem.sample_id,
                 "source_row_indices": list(poem.source_row_indices),
                 "source_urls": list(poem.source_urls),
@@ -797,6 +998,22 @@ def generate_one(
                     "passed" if attempts == 1 else "passed_after_repair"
                 ),
             }
+            _emit_client_trace(
+                client,
+                {
+                    "event": "final_output",
+                    "sample_id": poem.sample_id,
+                    "template_id": family.template_id,
+                    "parsed_instruction": instruction,
+                    "gemma_editorial_reasoning": reasoning,
+                    "final_assistant_response": response,
+                    "postprocessing": postprocessing,
+                    "generation_attempts": attempts,
+                    "validation_status": record["validation_status"],
+                    "origin": "generated_in_this_run",
+                },
+            )
+            return record
     raise GenerationError("validation failed after repairs: " + "; ".join(errors))
 
 
@@ -895,6 +1112,7 @@ def write_outputs(
     failures: dict[str, str],
     settings: GenerationSettings,
     source_fingerprint: str | None = None,
+    trace_run_id: str | None = None,
 ) -> None:
     """Materialize generated records, failures, and a run manifest.
 
@@ -914,6 +1132,7 @@ def write_outputs(
         failures: Latest error text keyed by sample ID.
         settings: Generation configuration to describe in the manifest.
         source_fingerprint: Optional SHA-256 digest of the source dataset.
+        trace_run_id: Optional audit run identifier recorded in the manifest.
 
     Raises:
         OSError: If the output directory or any output file cannot be written.
@@ -947,6 +1166,11 @@ def write_outputs(
             "max_source_chars": settings.max_source_chars,
             "chunk_chars": settings.chunk_chars,
         },
+        "trace": {
+            "enabled": trace_run_id is not None,
+            "run_id": trace_run_id,
+            "file": "generation_trace.jsonl" if trace_run_id is not None else None,
+        },
         "splits": dict(Counter(record["sft_split"] for record in ordered)),
         "templates": dict(Counter(record["template_id"] for record in ordered)),
         "oversized_for_sft": sum(
@@ -968,8 +1192,9 @@ def build_parser() -> ArgumentParser:
     The parser exposes source/output paths, endpoint and model selection, the
     environment-variable name holding the API key, TLS verification opt-out,
     worker concurrency, network and repair limits, sampling settings, prompt
-    size thresholds, and an optional poem limit. Defaults describe the standard
-    local Ashaar generation run, but no arguments are parsed by this function.
+    size thresholds, an optional poem limit, and full audit tracing. Defaults
+    describe the standard local Ashaar generation run, but no arguments are
+    parsed by this function.
 
     Returns:
         A configured :class:`argparse.ArgumentParser` ready to parse CLI input.
@@ -996,6 +1221,14 @@ def build_parser() -> ArgumentParser:
     parser.add_argument("--max-source-chars", type=int, default=24000)
     parser.add_argument("--chunk-chars", type=int, default=12000)
     parser.add_argument("--limit", type=int)
+    parser.add_argument(
+        "--trace",
+        action="store_true",
+        help=(
+            "print full generation audit events and append them to "
+            "OUTPUT_DIR/generation_trace.jsonl"
+        ),
+    )
     return parser
 
 
@@ -1110,7 +1343,57 @@ def run(args: Namespace) -> int:
         if sample_id in selected_ids and sample_id not in successes
     }
     pending = [poem for poem in poems if poem.sample_id not in successes]
-    client = GemmaClient(settings)
+    source_fingerprint = file_sha256(args.input)
+    tracer = (
+        GenerationTracer(
+            args.output_dir / "generation_trace.jsonl",
+            secrets=(settings.api_key,),
+        )
+        if args.trace
+        else None
+    )
+    if tracer is not None:
+        tracer.emit(
+            {
+                "event": "run_start",
+                "source_path": str(args.input),
+                "source_sha256": source_fingerprint,
+                "selected_poems": len(poems),
+                "checkpoint_reused": len(poems) - len(pending),
+                "pending_generation": len(pending),
+                "model": settings.model,
+                "endpoint": settings.endpoint,
+                "concurrency": args.concurrency,
+                "generation_settings": {
+                    "temperature": settings.temperature,
+                    "top_p": settings.top_p,
+                    "max_tokens": settings.max_tokens,
+                    "min_chars": settings.min_chars,
+                    "max_source_chars": settings.max_source_chars,
+                    "chunk_chars": settings.chunk_chars,
+                    "timeout": settings.timeout,
+                    "max_network_retries": settings.max_network_retries,
+                    "max_repairs": settings.max_repairs,
+                },
+                "meta_template_rationale": TEMPLATE_RATIONALE,
+                "meta_templates": [
+                    {
+                        "template_id": family.template_id,
+                        "focus": family.focus,
+                        "why_available": (
+                            "foregrounds this poetic dimension while retaining "
+                            "the shared instruction and reasoning contract"
+                        ),
+                    }
+                    for family in TEMPLATE_FAMILIES
+                ],
+                "checkpoint_note": (
+                    "checkpoint_reused counts existing successful records; all "
+                    "per-sample events in this run are newly generated"
+                ),
+            }
+        )
+    client = GemmaClient(settings, tracer=tracer)
     completed = len(poems) - len(pending)
 
     with ThreadPoolExecutor(max_workers=args.concurrency) as executor:
@@ -1140,6 +1423,16 @@ def run(args: Namespace) -> int:
                     "error": error,
                 }
                 status = "failed"
+                if tracer is not None:
+                    tracer.emit(
+                        {
+                            "event": "sample_failure",
+                            "sample_id": poem.sample_id,
+                            "error_type": type(exc).__name__,
+                            "error": error,
+                            "origin": "generated_in_this_run",
+                        }
+                    )
             append_checkpoint(checkpoint, event)
             with PRINT_LOCK:
                 print(f"[{completed}/{len(poems)}] {poem.sample_id[:12]} {status}")
@@ -1150,9 +1443,31 @@ def run(args: Namespace) -> int:
         successes,
         failures,
         settings,
-        source_fingerprint=file_sha256(args.input),
+        source_fingerprint=source_fingerprint,
+        trace_run_id=tracer.run_id if tracer is not None else None,
     )
     unresolved = [poem for poem in poems if poem.sample_id not in successes]
+    if tracer is not None:
+        tracer.emit(
+            {
+                "event": "run_summary",
+                "selected_poems": len(poems),
+                "checkpoint_reused": len(poems) - len(pending),
+                "generated_successes": sum(
+                    poem.sample_id in successes for poem in pending
+                ),
+                "unresolved_failures": len(unresolved),
+                "complete": not unresolved,
+                "template_distribution": dict(
+                    Counter(record["template_id"] for record in successes.values())
+                ),
+                "validation_status_distribution": dict(
+                    Counter(
+                        record["validation_status"] for record in successes.values()
+                    )
+                ),
+            }
+        )
     return 1 if unresolved else 0
 
 

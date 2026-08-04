@@ -280,6 +280,50 @@ used only for a trusted internal endpoint.
 Any credential pasted into chat, source code, shell history, or logs must be
 revoked and replaced before generation.
 
+### Full generation tracing
+
+Pass `--trace` to print complete, non-interleaved audit blocks to the terminal
+and append the same events as UTF-8 JSON lines to
+`generation_trace.jsonl`. The option is intended primarily for smoke samples,
+debugging, and audits because logging every few-shot prompt and completion for
+the full corpus consumes substantial terminal and disk space.
+
+The append-only trace assigns a new `run_id` to each invocation and records:
+
+- Run settings, source fingerprint, checkpoint reuse count, all six
+  meta-template definitions, and why meta-templates are used.
+- Per-poem provenance, eligible families, selected family and focus, and the
+  exact `sample_id[8:16]` modulo calculation behind the selection.
+- Every request kind: oversized-poem chunk analysis, initial generation, and
+  semantic repair.
+- The full OpenAI-compatible request body, including every system, few-shot,
+  and final user message, seed, and decoding settings.
+- The complete decoded API response payload. This retains endpoint-provided
+  fields such as `message.reasoning_content`, `finish_reason`, and `usage` when
+  the server supplies them.
+- Network-attempt counts, retry errors, and elapsed time.
+- Raw response content, parsed JSON, validation errors, and whether a repair is
+  required.
+- Parsed instruction, Gemma's editorial `reasoning` value, post-processing
+  counts, and the final assistant response after the exact source poem is
+  appended.
+- Final success, failure, template, and validation-status counts.
+
+The request body is the complete prompt representation available to this
+client. Any later conversion of those chat messages into Gemma's tokenized chat
+template happens inside the serving endpoint and cannot be observed here.
+
+The requested `reasoning` field is a synthetic editorial explanation emitted
+in Gemma's ordinary response content. It should not be described as private or
+otherwise inaccessible model reasoning. Gemma also does not generate the
+consolidated final poem: the program removes any poem echoes from the editorial
+reasoning and appends the trusted source poem. Consequently the trace labels
+the raw model content and final pipeline-composed response separately.
+
+The request headers are never included. Before an event is printed or written,
+the configured API key is recursively replaced with `[REDACTED]` anywhere it
+might appear in request, response, or error text.
+
 ## Response validation and repair
 
 The response parser first attempts to read the entire model response as JSON.
@@ -387,12 +431,21 @@ The pipeline writes the same logical records to `ashaar_sft.jsonl` and
 The output directory also contains:
 
 - `generation_checkpoint.jsonl`
+- `generation_trace.jsonl` when `--trace` is enabled
 - `failures.jsonl`
 - `manifest.json`
 
 The manifest records completion status, source SHA-256, template version, model
 and endpoint, decoding and length settings, output counts, split distribution,
 template distribution, oversized count, and metadata-conflict count.
+
+The trace file is intentionally a sidecar rather than part of the training
+schema. Complete prompts repeat the few-shot demonstrations, rejected outputs
+are not training targets, and both substantially increase storage. Therefore
+`ashaar_sft.jsonl` and `ashaar_sft.parquet` remain identical and
+trainer-focused; audit events are joined by `sample_id` when an investigation
+requires them. The manifest's `trace` object reports whether tracing was
+enabled, its `run_id`, and the sidecar filename.
 
 ## Running the pipeline
 
@@ -409,6 +462,7 @@ uv run python generate_sft.py `
   --input data/ashaar_classic_moroccan.parquet `
   --output-dir data/ashaar_sft_smoke `
   --limit 10 `
+  --trace `
   --insecure
 ```
 

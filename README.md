@@ -37,8 +37,17 @@ uv run python generate_sft.py `
   --input data/ashaar_classic_moroccan.parquet `
   --output-dir data/ashaar_sft_smoke `
   --limit 10 `
+  --trace `
   --insecure
 ```
+
+`--trace` prints a full audit block for each generation step and appends the
+same structured events to `generation_trace.jsonl`. The trace shows the
+meta-template catalog and rationale, the selected family and deterministic
+selection calculation, every complete message array sent to Gemma, the raw API
+response payload, validation and repair results, and the final response after
+the source poem is appended. Use it for smoke runs and audits; full-corpus
+traces are very large.
 
 Inspect the generated instructions and reasoning before starting the complete
 run:
@@ -84,6 +93,8 @@ The output directory contains:
 - `ashaar_sft.jsonl`: trainer-friendly records.
 - `ashaar_sft.parquet`: the same records in columnar form.
 - `generation_checkpoint.jsonl`: append-only resume state.
+- `generation_trace.jsonl`: optional append-only prompt/response audit created
+  by `--trace`.
 - `failures.jsonl`: currently unresolved samples.
 - `manifest.json`: generation settings and aggregate counts.
 
@@ -93,6 +104,13 @@ OpenAI-style `messages`, deterministic `sft_split`, and quality flags. Exact
 duplicate poem texts share one record and retain all source row indices and
 URLs. Splits are assigned from the poem hash using 98% train, 1% validation,
 and 1% test buckets.
+
+Full prompts and raw model responses are deliberately excluded from
+`ashaar_sft.jsonl` and `ashaar_sft.parquet`. Keeping them in the separate trace
+prevents accidental training on rejected attempts or few-shot demonstrations
+and avoids inflating every trainer-facing row. Each trace run has a unique
+`run_id`, which is also recorded in the manifest. Request headers and API keys
+are never traced; configured secrets are recursively redacted from event data.
 
 The assistant message contains synthetic editorial reasoning followed by the
 source poem formatted as:

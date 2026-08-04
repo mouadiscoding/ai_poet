@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+from contextlib import redirect_stdout
+import io
 import json
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 
 from generate_sft import (
+    GemmaClient,
     GenerationSettings,
+    GenerationTracer,
     PoemRecord,
     choose_family,
     compose_response,
@@ -77,9 +82,14 @@ def valid_value(poem: PoemRecord, minimum: int = 80) -> dict[str, str]:
 
 
 class QueueClient:
-    def __init__(self, outputs: list[str]) -> None:
+    def __init__(
+        self,
+        outputs: list[str],
+        tracer: GenerationTracer | None = None,
+    ) -> None:
         self.outputs = list(outputs)
         self.calls: list[list[dict[str, str]]] = []
+        self.tracer = tracer
 
     def chat(self, messages, **kwargs):
         self.calls.append(list(messages))
@@ -266,6 +276,86 @@ class ValidationTests(unittest.TestCase):
 
 
 class PipelineTests(unittest.TestCase):
+    def test_api_trace_contains_full_exchange_and_redacts_secret(self) -> None:
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return json.dumps(
+                    {
+                        "id": "completion-1",
+                        "model": "gemma-test",
+                        "choices": [
+                            {
+                                "message": {
+                                    "role": "assistant",
+                                    "content": "raw answer",
+                                    "reasoning_content": "server reasoning",
+                                },
+                                "finish_reason": "stop",
+                            }
+                        ],
+                        "usage": {"prompt_tokens": 10, "completion_tokens": 4},
+                    }
+                ).encode("utf-8")
+
+        TEST_TMP.mkdir(exist_ok=True)
+        path = TEST_TMP / "api_trace.jsonl"
+        remove_test_files(path.name)
+        self.addCleanup(remove_test_files, path.name)
+        tracer = GenerationTracer(path, secrets=("secret",))
+        client = GemmaClient(settings(), tracer=tracer)
+        stdout = io.StringIO()
+        with patch("generate_sft.urlopen", return_value=FakeResponse()):
+            with redirect_stdout(stdout):
+                result = client.chat(
+                    [{"role": "user", "content": "prompt containing secret"}],
+                    seed=42,
+                    trace_context={"sample_id": "abc", "request_kind": "initial"},
+                )
+
+        self.assertEqual(result, "raw answer")
+        event = json.loads(path.read_text("utf-8"))
+        self.assertEqual(event["request"]["messages"][0]["content"],
+                         "prompt containing [REDACTED]")
+        self.assertEqual(
+            event["response"]["choices"][0]["message"]["reasoning_content"],
+            "server reasoning",
+        )
+        self.assertEqual(event["response"]["usage"]["completion_tokens"], 4)
+        self.assertNotIn("secret", path.read_text("utf-8"))
+        self.assertNotIn("secret", stdout.getvalue())
+
+    def test_generation_trace_explains_template_and_records_final_output(self) -> None:
+        poem = make_poem()
+        value = valid_value(poem)
+        TEST_TMP.mkdir(exist_ok=True)
+        path = TEST_TMP / "generation_trace.jsonl"
+        remove_test_files(path.name)
+        self.addCleanup(remove_test_files, path.name)
+        tracer = GenerationTracer(path, secrets=("secret",))
+        client = QueueClient([json.dumps(value, ensure_ascii=False)], tracer=tracer)
+
+        with redirect_stdout(io.StringIO()):
+            record = generate_one(poem, client, settings())
+
+        events = [json.loads(line) for line in path.read_text("utf-8").splitlines()]
+        by_type = {event["event"]: event for event in events}
+        self.assertIn("why_used", by_type["template_selection"])
+        self.assertEqual(
+            by_type["validation_result"]["raw_model_content"],
+            json.dumps(value, ensure_ascii=False),
+        )
+        self.assertEqual(
+            by_type["final_output"]["final_assistant_response"], record["response"]
+        )
+        self.assertNotIn("raw_model_content", record)
+        self.assertNotIn("generation_trace", record)
+
     def test_generate_one_repairs_invalid_json(self) -> None:
         poem = make_poem()
         valid = json.dumps(valid_value(poem), ensure_ascii=False)
@@ -325,6 +415,7 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(pq.read_table(root / "ashaar_sft.parquet").num_rows, 1)
             manifest = json.loads((root / "manifest.json").read_text("utf-8"))
             self.assertTrue(manifest["complete"])
+            self.assertFalse(manifest["trace"]["enabled"])
         finally:
             remove_test_files(*generated_files)
 
