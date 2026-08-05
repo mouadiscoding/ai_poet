@@ -14,6 +14,13 @@ See [the complete SFT generation guide](docs/sft_dataset_generation.md) for the
 corpus audit, prompt architecture, validation contract, output schema, and
 operational details.
 
+Production code uses a `src` layout. Synthetic generation lives in
+`src/ai_poet/synthetic_data`, with separate modules for configuration, source
+corpus handling, API transport, prompts, validation, generation, persistence,
+and orchestration. Tests mirror those boundaries under `tests/unit` and
+`tests/integration`. Future workflows such as fine-tuning can be added as
+sibling packages under `src/ai_poet` without coupling them to data generation.
+
 ## Security first
 
 Never put an API key in the repository or command line. Revoke any key that has
@@ -40,7 +47,7 @@ values.
 Start with a small run:
 
 ```powershell
-uv run python generate_sft.py `
+uv run ai-poet-generate-sft `
   --input data/ashaar_classic_moroccan.parquet `
   --output-dir data/ashaar_sft_smoke `
   --limit 10 `
@@ -60,7 +67,7 @@ Inspect the generated instructions and reasoning before starting the complete
 run:
 
 ```powershell
-uv run python generate_sft.py `
+uv run ai-poet-generate-sft `
   --input data/ashaar_classic_moroccan.parquet `
   --output-dir data/ashaar_sft `
   --concurrency 4 `
@@ -69,7 +76,7 @@ uv run python generate_sft.py `
 
 The endpoint and model are required in `.env`; neither has a default embedded
 in the code. Run
-`uv run python generate_sft.py --help` for generation, validation, retry, and
+`uv run ai-poet-generate-sft --help` for generation, validation, retry, and
 context-size controls.
 
 ## Resume and failure handling

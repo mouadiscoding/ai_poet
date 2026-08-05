@@ -32,7 +32,8 @@ Store {user: instruction, assistant: response}
 [`download_ashaar.py`](../download_ashaar.py) only downloads the Ashaar dataset
 and writes it to Parquet. It does not use the prompt templates.
 
-[`load_poems()`](../generate_sft.py#L287) reads the Parquet file and:
+[`load_poems()`](../src/ai_poet/synthetic_data/corpus.py) reads the Parquet file
+and:
 
 - Treats `poem_verses` as alternating hemistichs.
 - Formats each pair as `first hemistich = second hemistich`.
@@ -46,7 +47,8 @@ targets.
 
 ## 2. Template families
 
-[`sft_templates.py`](../sft_templates.py#L45) defines six template families:
+[`prompts/families.py`](../src/ai_poet/synthetic_data/prompts/families.py)
+defines six template families:
 
 | Template ID | Main emphasis |
 | --- | --- |
@@ -62,8 +64,8 @@ placeholders. Each family provides an Arabic focus statement that tells the
 model which aspect of the reference poem to foreground while retaining the
 shared requirements for meaning, form, imagery, diction, and revision.
 
-[`choose_family()`](../generate_sft.py#L392) selects a family deterministically
-from the poem hash:
+[`choose_family()`](../src/ai_poet/synthetic_data/assignment.py) selects a
+family deterministically from the poem hash:
 
 ```python
 offset = int(poem.sample_id[8:16], 16) % len(families)
@@ -74,8 +76,8 @@ excludes `prosody_rhyme` because that family assumes a classical Arabic meter.
 
 ## 3. Few-shot prompt construction
 
-[`build_messages()`](../sft_templates.py#L334) constructs a six-message
-conversation for each poem:
+[`build_messages()`](../src/ai_poet/synthetic_data/prompts/builder.py) constructs
+a six-message conversation for each poem:
 
 ```text
 system:    generation policy, JSON contract, and template-family focus
@@ -100,12 +102,12 @@ The system prompt requires the model to:
 - Omit the complete final poem because the program will append it itself.
 
 There are separate example banks for
-[`METERED_FEW_SHOTS`](../sft_templates.py#L101) and
-[`PROSE_FEW_SHOTS`](../sft_templates.py#L157). The first example demonstrates
-the general output contract. The second example is specialized for the
-selected family through
-[`FAMILY_DEMO_ADDITIONS`](../sft_templates.py#L73), which adds family-specific
-guidance to both its example instruction and its example reasoning.
+[`METERED_FEW_SHOTS`](../src/ai_poet/synthetic_data/prompts/examples.py) and
+[`PROSE_FEW_SHOTS`](../src/ai_poet/synthetic_data/prompts/examples.py). The
+first example demonstrates the general output contract. The second example is
+specialized through
+[the family-specific demonstration fields](../src/ai_poet/synthetic_data/prompts/families.py),
+which add guidance to both its example instruction and reasoning.
 
 The final user message provides only the material needed for generation:
 
@@ -119,8 +121,9 @@ but are not supplied as content for the generated instruction.
 
 ## 4. Model generation and validation
 
-[`generate_one()`](../generate_sft.py#L692) sends the few-shot conversation to
-the OpenAI-compatible Gemma endpoint. The expected result is a JSON object:
+[`generate_one()`](../src/ai_poet/synthetic_data/generation.py) sends the
+few-shot conversation to the OpenAI-compatible Gemma endpoint. The expected
+result is a JSON object:
 
 ```json
 {
@@ -129,7 +132,8 @@ the OpenAI-compatible Gemma endpoint. The expected result is a JSON object:
 }
 ```
 
-[`validate_generation()`](../generate_sft.py#L507) checks that:
+[`validate_generation()`](../src/ai_poet/synthetic_data/validation.py) checks
+that:
 
 - The object has exactly the two expected fields.
 - Both values are strings and meet the configured minimum length.
@@ -152,7 +156,7 @@ are handled separately.
 The generated `instruction` becomes the training user message directly. The
 generated `reasoning` is not used unchanged.
 
-[`compose_response()`](../generate_sft.py#L588) removes:
+[`compose_response()`](../src/ai_poet/synthetic_data/responses.py) removes:
 
 - Any complete source poem echoed by the model.
 - Standalone source couplets or hemistichs.
@@ -174,8 +178,8 @@ answer. This prevents the target poem from being rewritten, normalized,
 re-diacritized, or hallucinated by the generation endpoint.
 
 The successful record assembled in
-[`generate_one()`](../generate_sft.py#L773) contains both flat fields and a
-chat-format representation:
+[`generate_one()`](../src/ai_poet/synthetic_data/generation.py) contains both
+flat fields and a chat-format representation:
 
 ```json
 {
@@ -201,9 +205,10 @@ conversation.
 ## 6. Oversized poems
 
 When a poem exceeds the configured direct-source limit,
-[`_chunk_analysis()`](../generate_sft.py#L636) divides it at complete-couplet
-boundaries and requests a compact analysis for each chunk. The ordered
-summaries replace the full source poem in the main generation prompt.
+[`_chunk_analysis()`](../src/ai_poet/synthetic_data/generation.py) divides it at
+complete-couplet boundaries and requests a compact analysis for each chunk.
+The ordered summaries replace the full source poem in the main generation
+prompt.
 
 This still produces one instruction-response pair for the complete poem. The
 complete original poem is appended to the assistant response, and the record is
@@ -212,12 +217,12 @@ own context-length policy.
 
 ## 7. Checkpointing and exports
 
-[`run()`](../generate_sft.py#L1068) processes pending poems concurrently and
-checkpoints every success or failure. Existing successful sample IDs are
-skipped when a run resumes.
+[`run()`](../src/ai_poet/synthetic_data/runner.py) processes pending poems
+concurrently and checkpoints every success or failure. Existing successful
+sample IDs are skipped when a run resumes.
 
-[`write_outputs()`](../generate_sft.py#L891) orders successful records by source
-order and writes them to:
+[`write_outputs()`](../src/ai_poet/synthetic_data/outputs.py) orders successful
+records by source order and writes them to:
 
 - `ashaar_sft.jsonl`
 - `ashaar_sft.parquet`

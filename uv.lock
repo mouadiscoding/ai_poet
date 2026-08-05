@@ -10,10 +10,11 @@ resolution-markers = [
 [[package]]
 name = "ai-poet"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "datasets" },
     { name = "huggingface-hub" },
+    { name = "pyarrow" },
     { name = "python-dotenv" },
 ]
 
@@ -21,6 +22,7 @@ dependencies = [
 requires-dist = [
     { name = "datasets", specifier = ">=4.0.0" },
     { name = "huggingface-hub", specifier = ">=1.26.0" },
+    { name = "pyarrow", specifier = ">=25.0.0" },
     { name = "python-dotenv", specifier = ">=1.1.0" },
 ]
 

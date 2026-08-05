@@ -2,6 +2,7 @@
 .venv/
 __pycache__/
 *.py[cod]
+*.egg-info/
 .uv-cache/
 # Environment Variables & Secrets
 .env

@@ -2,9 +2,9 @@
 
 ## Purpose
 
-This document describes the pipeline implemented by
-[`generate_sft.py`](../generate_sft.py) and
-[`sft_templates.py`](../sft_templates.py). The pipeline converts the poems in
+This document describes the pipeline implemented by the
+[`ai_poet.synthetic_data`](../src/ai_poet/synthetic_data) package. The pipeline
+converts the poems in
 `data/ashaar_classic_moroccan.parquet` into supervised fine-tuning examples
 containing:
 
@@ -442,7 +442,7 @@ GEMMA_API_KEY=replace-with-a-new-token
 Run a ten-poem inspection sample first:
 
 ```powershell
-uv run python generate_sft.py `
+uv run ai-poet-generate-sft `
   --input data/ashaar_classic_moroccan.parquet `
   --output-dir data/ashaar_sft_smoke `
   --limit 10 `
@@ -453,7 +453,7 @@ uv run python generate_sft.py `
 After manually reviewing the sample, run the corpus:
 
 ```powershell
-uv run python generate_sft.py `
+uv run ai-poet-generate-sft `
   --input data/ashaar_classic_moroccan.parquet `
   --output-dir data/ashaar_sft `
   --concurrency 4 `
@@ -464,7 +464,7 @@ Re-running the same command resumes from the checkpoint. See every available
 override with:
 
 ```powershell
-uv run python generate_sft.py --help
+uv run ai-poet-generate-sft --help
 ```
 
 ## Verification
