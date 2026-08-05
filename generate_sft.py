@@ -146,6 +146,10 @@ class GenerationError(RuntimeError):
     pass
 
 
+class GemmaConnectionError(GenerationError):
+    """Raised when Gemma remains unreachable after all connection retries."""
+
+
 class GemmaClient:
     def __init__(
         self,
@@ -188,8 +192,10 @@ class GemmaClient:
         seed values can override or augment those defaults. HTTP 429 and 5xx
         responses, along with transport, timeout, decoding, and malformed
         response errors, are retried with capped exponential backoff and
-        jitter. Other HTTP failures are reported immediately. The expected
-        response shape is ``choices[0].message.content``.
+        jitter. Transport failures that remain after all retries raise
+        :class:`GemmaConnectionError`; other HTTP failures are reported
+        immediately. The expected response shape is
+        ``choices[0].message.content``.
 
         Args:
             messages: Ordered chat messages. Each mapping must provide the
@@ -207,6 +213,8 @@ class GemmaClient:
             The first completion choice's message content, coerced to a string.
 
         Raises:
+            GemmaConnectionError: If Gemma remains unreachable after every
+                configured connection retry.
             GenerationError: If a non-retryable HTTP response is received or
                 every configured retry fails. Error text is sanitized so the
                 configured API key is not exposed.
@@ -236,7 +244,7 @@ class GemmaClient:
 
         started = time.perf_counter()
         retry_errors: list[dict[str, Any]] = []
-        for attempt in range(self.settings.max_network_retries):
+        for attempt in range(self.settings.max_network_retries + 1):
             try:
                 with urlopen(  # noqa: S310 - user-configured HTTPS endpoint
                     request,
@@ -255,12 +263,12 @@ class GemmaClient:
                         "retryable": retryable,
                     }
                 )
-                if not retryable or attempt + 1 == self.settings.max_network_retries:
+                if not retryable or attempt == self.settings.max_network_retries:
                     self._trace_api_failure(
                         body, trace_context, attempt + 1, retry_errors, started
                     )
                     raise GenerationError(f"API returned HTTP {exc.code}") from exc
-            except (URLError, TimeoutError, OSError, KeyError, ValueError) as exc:
+            except (URLError, TimeoutError, OSError) as exc:
                 safe_error = str(exc).replace(self.settings.api_key, "[REDACTED]")
                 retry_errors.append(
                     {
@@ -270,7 +278,25 @@ class GemmaClient:
                         "retryable": True,
                     }
                 )
-                if attempt + 1 == self.settings.max_network_retries:
+                if attempt == self.settings.max_network_retries:
+                    self._trace_api_failure(
+                        body, trace_context, attempt + 1, retry_errors, started
+                    )
+                    raise GemmaConnectionError(
+                        "Gemma REST API connection failed after "
+                        f"{self.settings.max_network_retries} retries: {safe_error}"
+                    ) from exc
+            except (KeyError, ValueError) as exc:
+                safe_error = str(exc).replace(self.settings.api_key, "[REDACTED]")
+                retry_errors.append(
+                    {
+                        "network_attempt": attempt + 1,
+                        "error_type": type(exc).__name__,
+                        "message": safe_error,
+                        "retryable": True,
+                    }
+                )
+                if attempt == self.settings.max_network_retries:
                     self._trace_api_failure(
                         body, trace_context, attempt + 1, retry_errors, started
                     )
@@ -1212,7 +1238,7 @@ def build_parser() -> ArgumentParser:
     parser.add_argument("--insecure", action="store_true")
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--timeout", type=float, default=300.0)
-    parser.add_argument("--max-network-retries", type=int, default=5)
+    parser.add_argument("--max-network-retries", type=int, default=3)
     parser.add_argument("--max-repairs", type=int, default=2)
     parser.add_argument("--temperature", type=float, default=0.4)
     parser.add_argument("--top-p", type=float, default=0.9)
@@ -1294,6 +1320,8 @@ def _settings(args: Namespace) -> GenerationSettings:
         )
     if args.concurrency < 1:
         raise ValueError("--concurrency must be at least 1")
+    if args.max_network_retries < 0:
+        raise ValueError("--max-network-retries cannot be negative")
     return GenerationSettings(
         endpoint=endpoint,
         model=model,
@@ -1319,9 +1347,11 @@ def run(args: Namespace) -> int:
     success are submitted to a thread pool. Each finished task is immediately
     checkpointed as a success or sanitized failure, allowing later invocations
     to resume without regenerating completed samples. Individual generation
-    exceptions do not abort the corpus. Successful records are flushed to the
-    SFT JSONL file as each task finishes; final ordered JSONL, Parquet, failure,
-    and manifest outputs are written after all pending tasks finish.
+    exceptions do not abort the corpus, except an exhausted Gemma connection
+    failure, which cancels pending work and aborts the run. Successful records
+    are flushed to the SFT JSONL file as each task finishes; final ordered
+    JSONL, Parquet, failure, and manifest outputs are written after all pending
+    tasks finish.
 
     Args:
         args: Parsed CLI namespace containing every option registered by
@@ -1331,6 +1361,8 @@ def run(args: Namespace) -> int:
         Zero when every selected poem has a successful record, otherwise one.
 
     Raises:
+        GemmaConnectionError: If Gemma remains unreachable after every
+            configured connection retry.
         ValueError: If configuration, the optional limit, or source poem data is
             invalid.
         OSError: If required input or output files cannot be accessed.
@@ -1437,6 +1469,10 @@ def run(args: Namespace) -> int:
                     "record": record,
                 }
                 status = "ok"
+            except GemmaConnectionError:
+                for pending_future in futures:
+                    pending_future.cancel()
+                raise
             except Exception as exc:  # keep the corpus run resumable
                 error = str(exc).replace(settings.api_key, "[REDACTED]")
                 failures[poem.sample_id] = error
@@ -1501,16 +1537,17 @@ def main() -> None:
 
     Normal completion exits with the status returned by :func:`run`: zero for a
     complete corpus and one for unresolved per-poem failures. Top-level
-    ``OSError`` and ``ValueError`` exceptions are rendered as concise messages
-    on standard error and converted to exit status two. Other unexpected
-    exceptions are allowed to propagate with their traceback.
+    Gemma connection failures, ``OSError``, and ``ValueError`` exceptions are
+    rendered as concise messages on standard error and converted to exit status
+    two. Other unexpected exceptions are allowed to propagate with their
+    traceback.
 
     Raises:
         SystemExit: Always, with status zero, one, or two as described above.
     """
     try:
         code = run(build_parser().parse_args())
-    except (OSError, ValueError) as exc:
+    except (GemmaConnectionError, OSError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         raise SystemExit(2) from exc
     raise SystemExit(code)

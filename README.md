@@ -77,8 +77,10 @@ context-size controls.
 Every completed request is appended immediately to
 `generation_checkpoint.jsonl`. Re-running the same command skips successful
 sample IDs and retries unresolved failures. Transient HTTP failures are retried
-up to five times; structurally or semantically invalid model responses receive
-up to two repair prompts.
+up to three times with exponential backoff. Connection failures use the same
+backoff and stop the entire script if Gemma is still unreachable after the
+third retry. Structurally or semantically invalid model responses receive up to
+two repair prompts.
 
 Each successful record is also appended and flushed immediately to
 `ashaar_sft.jsonl`, so the training data can be inspected while generation is
