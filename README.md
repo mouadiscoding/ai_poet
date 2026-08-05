@@ -7,8 +7,10 @@ instruction and an editorial reasoning section. The program then appends the
 original poem itself, rather than allowing the language model to reproduce or
 modify the training target.
 
-The generator uses six prompt families and two few-shot user/assistant examples
-inside every request. Metered and prose poems have separate demonstrations.
+The generator randomly chooses one of six concrete prompt templates for each
+poem. Every template and every few-shot example covers prosody or internal
+rhythm, semantic progression, imagery, voice, occasion, and diction/revision.
+Metered and prose poems have separate demonstrations.
 
 See [the complete SFT generation guide](docs/sft_dataset_generation.md) for the
 corpus audit, prompt architecture, validation contract, output schema, and
@@ -57,11 +59,10 @@ uv run ai-poet-generate-sft `
 
 `--trace` prints a full audit block for each generation step and appends the
 same structured events to `generation_trace.jsonl`. The trace shows the
-meta-template catalog and rationale, the selected family and deterministic
-selection calculation, every complete message array sent to Gemma, the raw API
-response payload, validation and repair results, and the final response after
-the source poem is appended. Use it for smoke runs and audits; full-corpus
-traces are very large.
+concrete-template catalog and rationale, the fresh random selection, every
+complete message array sent to Gemma, raw generation and Gemma-validation
+payloads, repair results, and the final response after the source poem is
+appended. Use it for smoke runs and audits; full-corpus traces are very large.
 
 Inspect the generated instructions and reasoning before starting the complete
 run:
@@ -83,11 +84,14 @@ context-size controls.
 
 Every completed request is appended immediately to
 `generation_checkpoint.jsonl`. Re-running the same command skips successful
-sample IDs and retries unresolved failures. Transient HTTP failures are retried
+template-version-2 sample IDs and retries unresolved or legacy successes.
+Transient HTTP failures are retried
 up to three times with exponential backoff. Connection failures use the same
 backoff and stop the entire script if Gemma is still unreachable after the
-third retry. Structurally or semantically invalid model responses receive up to
-two repair prompts.
+third retry. Responses that cannot be parsed receive format repair prompts.
+Every parseable instruction/reasoning pair is sent back to Gemma for field-level
+validation; Gemma rejections receive up to two repair prompts. There is no
+deterministic Python content validator.
 
 Each successful record is also appended and flushed immediately to
 `ashaar_sft.jsonl`, so the training data can be inspected while generation is
@@ -115,8 +119,9 @@ The output directory contains:
 - `manifest.json`: generation settings and aggregate counts.
 
 Each training record includes the source hash and provenance, meter ID and
-name, couplet count, template ID, generated `instruction`, composed `response`,
-OpenAI-style `messages`, deterministic `sft_split`, and quality flags. Exact
+name, couplet count, concrete template ID and version, generated `instruction`,
+composed `response`, OpenAI-style `messages`, deterministic `sft_split`, and
+quality flags. Exact
 duplicate poem texts share one record and retain all source row indices and
 URLs. Splits are assigned from the poem hash using 98% train, 1% validation,
 and 1% test buckets.

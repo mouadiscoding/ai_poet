@@ -12,6 +12,7 @@ import pyarrow.parquet as pq
 
 from .config import GenerationSettings
 from .poems import PoemRecord
+from .prompts.templates import TEMPLATE_VERSION
 
 
 def write_jsonl(path: Path, records: Iterable[dict[str, Any]]) -> None:
@@ -93,7 +94,7 @@ def write_outputs(
         "model": settings.model,
         "endpoint": settings.endpoint,
         "source_sha256": source_fingerprint,
-        "template_version": 1,
+        "template_version": TEMPLATE_VERSION,
         "generation": {
             "temperature": settings.temperature,
             "top_p": settings.top_p,

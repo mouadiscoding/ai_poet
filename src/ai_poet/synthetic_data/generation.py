@@ -5,21 +5,26 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from .assignment import choose_family, sft_split
+from .assignment import choose_template, sft_split
 from .client import GemmaClient
 from .config import GenerationSettings
 from .errors import GenerationError
 from .poems import PoemRecord, split_poem_chunks
-from .prompts.builder import build_messages
-from .prompts.families import eligible_families
+from .prompts.builder import build_messages, build_validation_messages
+from .prompts.templates import PROMPT_TEMPLATES, TEMPLATE_VERSION
 from .responses import compose_response
-from .validation import extract_json_object, validate_generation
+from .validation import (
+    extract_generated_pair,
+    extract_json_object,
+    parse_validation_verdict,
+    verdict_errors,
+)
 
 
 TEMPLATE_RATIONALE = (
-    "Meta-template families diversify the reverse-generated instructions while "
-    "keeping the shared poetry constraints fixed. Selection is deterministic "
-    "from the poem hash so it is reproducible and approximately balanced."
+    "Six concrete prompts vary the order and framing of the reverse-generation "
+    "task while every prompt requires all six poetic dimensions. One template "
+    "is chosen uniformly without a seed for each generation call."
 )
 
 
@@ -98,15 +103,13 @@ def generate_one(
     client: GemmaClient,
     settings: GenerationSettings,
 ) -> dict[str, Any]:
-    """Generate and validate one complete supervised fine-tuning record.
+    """Generate and Gemma-validate one supervised fine-tuning record.
 
-    A prompt family is selected deterministically from the poem ID. Poems over
-    ``max_source_chars`` are summarized in chunks before prompt construction;
-    shorter poems are included verbatim. The model is asked for JSON containing
-    an instruction and editorial reasoning. Invalid JSON or content triggers up
-    to ``max_repairs`` follow-up attempts that include the previous answer and
-    all validation errors. Seeds are stable across runs and incremented for
-    each repair.
+    One concrete prompt is chosen randomly and retained throughout this call.
+    Poems over ``max_source_chars`` are summarized in chunks; the same source
+    material is then supplied to generation and validation. Python performs
+    only the parsing needed to extract the pair. Gemma alone judges its quality
+    and supplies field-level feedback for up to ``max_repairs`` revisions.
 
     On success, the reasoning is cleaned and combined with the exact source
     poem. The returned dictionary contains provenance, meter and template
@@ -126,10 +129,7 @@ def generate_one(
             invalid after the configured number of repair attempts.
         ValueError: If chunk settings or poem formatting invariants are invalid.
     """
-    family = choose_family(poem)
-    families = eligible_families(poem.meter_name)
-    selector_hex = poem.sample_id[8:16]
-    selected_index = int(selector_hex, 16) % len(families)
+    template = choose_template()
     _emit_client_trace(
         client,
         {
@@ -141,20 +141,12 @@ def generate_one(
             "meter_name": poem.meter_name,
             "couplet_count": poem.couplet_count,
             "source_characters": len(poem.poem_text),
-            "eligible_template_ids": [item.template_id for item in families],
-            "selected_template_id": family.template_id,
-            "selected_template_focus": family.focus,
+            "eligible_template_ids": [item.template_id for item in PROMPT_TEMPLATES],
+            "selected_template_id": template.template_id,
             "why_used": {
                 "purpose": TEMPLATE_RATIONALE,
-                "eligibility": (
-                    "prosody_rhyme is excluded because this is prose poetry"
-                    if poem.meter_name == "النثر"
-                    else "all template families are eligible for a metered poem"
-                ),
-                "selection": (
-                    f"int(sample_id[8:16], 16) % {len(families)} = "
-                    f"int('{selector_hex}', 16) % {len(families)} = {selected_index}"
-                ),
+                "eligibility": "all six templates support metered and prose poems",
+                "selection": "fresh uniform random choice, made once for this call",
             },
         },
     )
@@ -162,13 +154,20 @@ def generate_one(
     notes = (
         _chunk_analysis(client, poem, settings.chunk_chars) if oversized else None
     )
+    if oversized:
+        source_material = (
+            "القصيدة طويلة؛ المرجع الآتي ملخصات تحليلية لمقاطعها مرتبة. "
+            "قيّم وأنشئ زوجًا يغطي القصيدة كلها من غير افتراض ما لم تذكره الملخصات:\n"
+            f"{notes}"
+        )
+    else:
+        source_material = poem.poem_text
     messages = build_messages(
-        family=family,
+        template=template,
         meter_name=poem.meter_name,
         couplet_count=poem.couplet_count,
-        poem_text=None if oversized else poem.poem_text,
+        poem=source_material,
         minimum_chars=settings.min_chars,
-        analysis_notes=notes,
     )
 
     raw = ""
@@ -202,30 +201,95 @@ def generate_one(
                 "request_kind": "initial_generation" if repair == 0 else "repair",
                 "generation_attempt": attempts,
                 "repair_index": repair,
-                "template_id": family.template_id,
+                "template_id": template.template_id,
             },
         )
         try:
             value = extract_json_object(raw)
-            errors = validate_generation(value, poem, settings.min_chars)
+            instruction, reasoning = extract_generated_pair(value)
         except (ValueError, json.JSONDecodeError) as exc:
-            value = {}
             errors = [str(exc)]
+            _emit_client_trace(
+                client,
+                {
+                    "event": "generation_parse_result",
+                    "sample_id": poem.sample_id,
+                    "generation_attempt": attempts,
+                    "raw_model_content": raw,
+                    "passed": False,
+                    "serialization_errors": errors,
+                },
+            )
+            continue
+
+        instruction = instruction.strip()
+        reasoning = reasoning.strip()
+        candidate = dict(value)
+        candidate["instruction"] = instruction
+        candidate["reasoning"] = reasoning
         _emit_client_trace(
             client,
             {
-                "event": "validation_result",
+                "event": "generation_parse_result",
                 "sample_id": poem.sample_id,
                 "generation_attempt": attempts,
                 "raw_model_content": raw,
-                "parsed_output": value,
+                "parsed_output": candidate,
+                "passed": True,
+                "serialization_errors": [],
+            },
+        )
+
+        validation_raw = client.chat(
+            build_validation_messages(
+                candidate=candidate,
+                meter_name=poem.meter_name,
+                couplet_count=poem.couplet_count,
+                poem=source_material,
+                minimum_chars=settings.min_chars,
+            ),
+            max_tokens=1200,
+            temperature=0.0,
+            seed=seed + 100_000 + repair,
+            trace_context={
+                "sample_id": poem.sample_id,
+                "request_kind": "gemma_validation",
+                "generation_attempt": attempts,
+                "repair_index": repair,
+                "template_id": template.template_id,
+            },
+        )
+        try:
+            verdict = parse_validation_verdict(validation_raw)
+        except (ValueError, json.JSONDecodeError) as exc:
+            _emit_client_trace(
+                client,
+                {
+                    "event": "gemma_validation_result",
+                    "sample_id": poem.sample_id,
+                    "generation_attempt": attempts,
+                    "raw_validator_content": validation_raw,
+                    "passed": False,
+                    "validator_protocol_error": str(exc),
+                },
+            )
+            raise GenerationError(
+                f"Gemma validation response was invalid: {exc}"
+            ) from exc
+        errors = verdict_errors(verdict)
+        _emit_client_trace(
+            client,
+            {
+                "event": "gemma_validation_result",
+                "sample_id": poem.sample_id,
+                "generation_attempt": attempts,
+                "raw_validator_content": validation_raw,
+                "parsed_verdict": verdict,
                 "passed": not errors,
                 "validation_errors": errors,
             },
         )
         if not errors:
-            instruction = str(value["instruction"]).strip()
-            reasoning = str(value["reasoning"]).strip()
             response = compose_response(reasoning, poem)
             source_lines = {
                 line.strip() for line in poem.poem_text.splitlines() if line.strip()
@@ -252,7 +316,8 @@ def generate_one(
                 "meter_id": poem.meter_id,
                 "meter_name": poem.meter_name,
                 "couplet_count": poem.couplet_count,
-                "template_id": family.template_id,
+                "template_id": template.template_id,
+                "template_version": TEMPLATE_VERSION,
                 "instruction": instruction,
                 "response": response,
                 "messages": [
@@ -275,7 +340,7 @@ def generate_one(
                 {
                     "event": "final_output",
                     "sample_id": poem.sample_id,
-                    "template_id": family.template_id,
+                    "template_id": template.template_id,
                     "parsed_instruction": instruction,
                     "gemma_editorial_reasoning": reasoning,
                     "final_assistant_response": response,

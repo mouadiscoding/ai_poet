@@ -59,6 +59,13 @@ def valid_value(poem: PoemRecord, minimum: int = 80) -> dict[str, str]:
     }
 
 
+def valid_verdict() -> dict[str, dict[str, object]]:
+    return {
+        "instruction": {"passed": True, "errors": []},
+        "reasoning": {"passed": True, "errors": []},
+    }
+
+
 class QueueClient:
     def __init__(
         self,
@@ -67,10 +74,12 @@ class QueueClient:
     ) -> None:
         self.outputs = list(outputs)
         self.calls: list[list[dict[str, str]]] = []
+        self.call_kwargs: list[dict[str, object]] = []
         self.tracer = tracer
 
     def chat(self, messages, **kwargs):
         self.calls.append(list(messages))
+        self.call_kwargs.append(dict(kwargs))
         if not self.outputs:
             raise AssertionError("unexpected client call")
         return self.outputs.pop(0)

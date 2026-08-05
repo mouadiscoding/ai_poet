@@ -3,44 +3,94 @@ from __future__ import annotations
 import json
 import unittest
 
-from ai_poet.synthetic_data.prompts.builder import build_messages
-from ai_poet.synthetic_data.prompts.families import TEMPLATE_FAMILIES, eligible_families
-from tests.synthetic_data_helpers import make_poem
+from ai_poet.synthetic_data.prompts.builder import (
+    build_messages,
+    build_validation_messages,
+)
+from ai_poet.synthetic_data.prompts.templates import (
+    ALL_FOCUS_REQUIREMENTS,
+    PROMPT_TEMPLATES,
+)
+from tests.synthetic_data_helpers import make_poem, valid_value
+
+
+FOCUS_TERM_GROUPS = (
+    ("وزن", "إيقاع"),
+    ("معنى", "دلال"),
+    ("صورة", "استعار", "بلاغ"),
+    ("نبرة", "عاطف", "صوت"),
+    ("مقام", "مخاطب", "المخاطَب"),
+    ("تحرير", "صياغ", "بديل", "معجم"),
+)
+
 
 class TemplateTests(unittest.TestCase):
-    def test_every_family_builds_two_few_shot_pairs(self) -> None:
+    def test_every_concrete_template_renders_all_focuses_and_poem(self) -> None:
         poem = make_poem()
-        family_specific_examples = set()
-        for family in TEMPLATE_FAMILIES:
+        self.assertEqual(len(PROMPT_TEMPLATES), 6)
+        for template in PROMPT_TEMPLATES:
+            self.assertIn("{poem}", template.prompt)
             messages = build_messages(
-                family=family,
+                template=template,
                 meter_name=poem.meter_name,
                 couplet_count=poem.couplet_count,
-                poem_text=poem.poem_text,
+                poem=poem.poem_text,
                 minimum_chars=1500,
             )
-            self.assertEqual([m["role"] for m in messages], [
-                "system", "user", "assistant", "user", "assistant", "user"
-            ])
-            for assistant in (messages[2], messages[4]):
-                self.assertEqual(
-                    set(json.loads(assistant["content"])),
-                    {"instruction", "reasoning"},
-                )
-            self.assertIn(family.focus, messages[0]["content"])
-            self.assertIn(family.focus, messages[3]["content"])
-            family_specific_examples.add(messages[4]["content"])
-        self.assertEqual(len(family_specific_examples), len(TEMPLATE_FAMILIES))
+            self.assertEqual(
+                [message["role"] for message in messages],
+                ["system", "user", "assistant", "user", "assistant", "user"],
+            )
+            self.assertIn(ALL_FOCUS_REQUIREMENTS, messages[0]["content"])
+            self.assertIn(ALL_FOCUS_REQUIREMENTS, messages[-1]["content"])
+            self.assertIn(poem.poem_text, messages[-1]["content"])
+            self.assertNotIn("{poem}", messages[-1]["content"])
 
-    def test_prose_uses_prose_examples_and_excludes_prosody_family(self) -> None:
-        families = eligible_families("النثر")
-        self.assertNotIn("prosody_rhyme", {f.template_id for f in families})
-        messages = build_messages(
-            family=families[0],
-            meter_name="النثر",
-            couplet_count=1,
-            poem_text="صورة أولى = صورة ثانية",
-            minimum_chars=100,
+    def test_every_few_shot_field_demonstrates_all_focuses(self) -> None:
+        poem = make_poem()
+        for meter_name in (poem.meter_name, "النثر"):
+            messages = build_messages(
+                template=PROMPT_TEMPLATES[0],
+                meter_name=meter_name,
+                couplet_count=poem.couplet_count,
+                poem=poem.poem_text,
+                minimum_chars=100,
+            )
+            for assistant in (messages[2], messages[4]):
+                example = json.loads(assistant["content"])
+                self.assertEqual(set(example), {"instruction", "reasoning"})
+                for field in ("instruction", "reasoning"):
+                    for terms in FOCUS_TERM_GROUPS:
+                        self.assertTrue(
+                            any(term in example[field] for term in terms),
+                            f"{meter_name} {field} misses {terms}",
+                        )
+
+    def test_prose_can_use_every_template_and_adapts_prosody(self) -> None:
+        for template in PROMPT_TEMPLATES:
+            messages = build_messages(
+                template=template,
+                meter_name="النثر",
+                couplet_count=1,
+                poem="صورة أولى = صورة ثانية",
+                minimum_chars=100,
+            )
+            self.assertIn("بلا وزن خليلي", messages[-1]["content"])
+            self.assertIn("الإيقاع الداخلي", messages[-1]["content"])
+
+    def test_validation_prompt_contains_pair_reference_and_all_criteria(self) -> None:
+        poem = make_poem()
+        candidate = valid_value(poem)
+        messages = build_validation_messages(
+            candidate=candidate,
+            meter_name=poem.meter_name,
+            couplet_count=poem.couplet_count,
+            poem=poem.poem_text,
+            minimum_chars=80,
         )
-        prose_demonstration = json.loads(messages[2]["content"])
-        self.assertIn("الشعر المنثور", prose_demonstration["instruction"])
+        self.assertEqual([message["role"] for message in messages], ["system", "user"])
+        self.assertIn(poem.poem_text, messages[1]["content"])
+        self.assertIn(candidate["instruction"], messages[1]["content"])
+        self.assertIn(ALL_FOCUS_REQUIREMENTS, messages[1]["content"])
+        self.assertIn("instruction", messages[0]["content"])
+        self.assertIn("reasoning", messages[0]["content"])

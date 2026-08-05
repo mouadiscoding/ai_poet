@@ -1,9 +1,10 @@
-"""Deterministic dataset-split and prompt-family assignment."""
+"""Dataset-split assignment and random prompt-template selection."""
 
 from __future__ import annotations
 
-from .poems import PoemRecord
-from .prompts.families import TemplateFamily, eligible_families
+import random
+
+from .prompts.templates import PROMPT_TEMPLATES, PromptTemplate
 
 
 def sft_split(sample_id: str) -> str:
@@ -32,23 +33,11 @@ def sft_split(sample_id: str) -> str:
     return "test"
 
 
-def choose_family(poem: PoemRecord) -> TemplateFamily:
-    """Choose a deterministic prompt-template family for a poem.
+def choose_template() -> PromptTemplate:
+    """Choose one concrete prompt template uniformly for a generation run.
 
-    Eligibility is determined by the poem's meter; notably, prose poems cannot
-    use the prosody-and-rhyme family. The next eight hexadecimal digits of the
-    sample ID select uniformly by modulo from the eligible tuple, so duplicate
-    content always receives the same template across runs.
-
-    Args:
-        poem: Canonical poem whose meter and sample ID drive selection.
-
-    Returns:
-        The selected :class:`TemplateFamily`.
-
-    Raises:
-        ValueError: If the relevant sample-ID characters are not hexadecimal.
+    Selection deliberately has no content-derived seed. A repair within the
+    same generation call retains the selected template, while a later rerun of
+    an unresolved poem may choose another template.
     """
-    families = eligible_families(poem.meter_name)
-    offset = int(poem.sample_id[8:16], 16) % len(families)
-    return families[offset]
+    return random.choice(PROMPT_TEMPLATES)

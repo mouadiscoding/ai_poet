@@ -9,7 +9,7 @@ supervised fine-tuning example.
 Source poem
    |
    v
-Choose a template family
+Choose a concrete template randomly
    |
    v
 Build a six-message few-shot prompt
@@ -45,10 +45,10 @@ Consequently, each unique poem normally produces exactly one training pair.
 Duplicate source rows retain their provenance but do not create duplicate
 targets.
 
-## 2. Template families
+## 2. Concrete templates
 
-[`prompts/families.py`](../src/ai_poet/synthetic_data/prompts/families.py)
-defines six template families:
+[`prompts/templates.py`](../src/ai_poet/synthetic_data/prompts/templates.py)
+defines six complete, renderable prompt templates:
 
 | Template ID | Main emphasis |
 | --- | --- |
@@ -59,20 +59,17 @@ defines six template families:
 | `occasion_addressee` | Occasion, addressee, and communicative purpose |
 | `diction_revision` | Diction, syntax, alternatives, and revision |
 
-These are meta-templates rather than final instructions with simple
-placeholders. Each family provides an Arabic focus statement that tells the
-model which aspect of the reference poem to foreground while retaining the
-shared requirements for meaning, form, imagery, diction, and revision.
+Every template contains a literal `{poem}` placeholder plus placeholders for
+the form, numeric unit count, and minimum field length. The templates vary the
+order and framing of the analysis, but every one explicitly requires all six
+dimensions: sound/form, semantic progression, imagery/rhetoric, emotion/voice,
+occasion/addressee, and diction/revision.
 
-[`choose_family()`](../src/ai_poet/synthetic_data/assignment.py) selects a
-family deterministically from the poem hash:
-
-```python
-offset = int(poem.sample_id[8:16], 16) % len(families)
-```
-
-The same poem therefore receives the same family across runs. Prose poetry
-excludes `prosody_rhyme` because that family assumes a classical Arabic meter.
+[`choose_template()`](../src/ai_poet/synthetic_data/assignment.py) makes a fresh
+uniform random choice once per poem-generation call. Repairs retain that
+choice; rerunning an unresolved poem may choose another template. All six are
+eligible for prose, where prosody is adapted to internal rhythm, parallelism,
+sound, and observable rhyme rather than a classical meter.
 
 ## 3. Few-shot prompt construction
 
@@ -80,7 +77,7 @@ excludes `prosody_rhyme` because that family assumes a classical Arabic meter.
 a six-message conversation for each poem:
 
 ```text
-system:    generation policy, JSON contract, and template-family focus
+system:    generation policy, JSON contract, and all six focuses
 user:      demonstration source poem 1
 assistant: demonstration JSON 1
 user:      demonstration source poem 2
@@ -103,11 +100,10 @@ The system prompt requires the model to:
 
 There are separate example banks for
 [`METERED_FEW_SHOTS`](../src/ai_poet/synthetic_data/prompts/examples.py) and
-[`PROSE_FEW_SHOTS`](../src/ai_poet/synthetic_data/prompts/examples.py). The
-first example demonstrates the general output contract. The second example is
-specialized through
-[the family-specific demonstration fields](../src/ai_poet/synthetic_data/prompts/families.py),
-which add guidance to both its example instruction and reasoning.
+[`PROSE_FEW_SHOTS`](../src/ai_poet/synthetic_data/prompts/examples.py). Every
+example instruction and reasoning trace demonstrates all six focuses. The
+prose demonstrations replace metrical scansion with internal rhythm and avoid
+inventing a classical meter.
 
 The final user message provides only the material needed for generation:
 
@@ -132,24 +128,18 @@ result is a JSON object:
 }
 ```
 
-[`validate_generation()`](../src/ai_poet/synthetic_data/validation.py) checks
-that:
+Python performs only the JSON extraction and string-type checks required to
+obtain `instruction` and `reasoning`; it does not judge their poetic content.
 
-- The object has exactly the two expected fields.
-- Both values are strings and meet the configured minimum length.
-- The combined content is predominantly Arabic.
-- The instruction contains the exact numeric couplet count.
-- The instruction names the correct meter or explicitly requests prose.
-- The instruction does not name a conflicting meter.
-- The instruction does not reproduce a complete source hemistich.
-- The reasoning discusses meaning, imagery or rhetoric, and revision.
-- Metered reasoning discusses meter, rhythm, or prosody.
-- The reasoning contains the final-result transition.
-
-If parsing or validation fails, the generator adds the invalid response and the
-specific validation errors to the original conversation, then asks the model
-for a complete corrected JSON object. Network retries and semantic repair calls
-are handled separately.
+Every parseable pair is sent to Gemma in a separate zero-temperature validation
+request together with the same reference material, expected form, exact unit
+count, minimum lengths, and six-focus contract. Gemma returns separate
+`passed`/`errors` verdicts for `instruction` and `reasoning`, and both must pass.
+It checks schema, Arabic language, grounding, correct form and count, all six
+focuses, instruction quality, editorial reasoning quality, and cross-field
+consistency. A rejection becomes repair feedback in the original generation
+conversation. A malformed validator response fails the sample safely instead
+of approving it. Network retries remain separate.
 
 ## 5. Forming the final instruction-response pair
 
@@ -207,8 +197,8 @@ conversation.
 When a poem exceeds the configured direct-source limit,
 [`_chunk_analysis()`](../src/ai_poet/synthetic_data/generation.py) divides it at
 complete-couplet boundaries and requests a compact analysis for each chunk.
-The ordered summaries replace the full source poem in the main generation
-prompt.
+The ordered summaries replace the full source poem in both the main generation
+prompt and its Gemma validation prompt.
 
 This still produces one instruction-response pair for the complete poem. The
 complete original poem is appended to the assistant response, and the record is
@@ -219,7 +209,8 @@ own context-length policy.
 
 [`run()`](../src/ai_poet/synthetic_data/runner.py) processes pending poems
 concurrently and checkpoints every success or failure. Existing successful
-sample IDs are skipped when a run resumes.
+sample IDs are skipped on resume only when their `template_version` is `2`;
+older records remain in the append-only checkpoint and are regenerated.
 
 [`write_outputs()`](../src/ai_poet/synthetic_data/outputs.py) orders successful
 records by source order and writes them to:

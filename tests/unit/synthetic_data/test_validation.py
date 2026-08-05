@@ -4,8 +4,13 @@ import json
 import unittest
 
 from ai_poet.synthetic_data.responses import compose_response
-from ai_poet.synthetic_data.validation import extract_json_object, validate_generation
-from tests.synthetic_data_helpers import make_poem, valid_value
+from ai_poet.synthetic_data.validation import (
+    extract_generated_pair,
+    extract_json_object,
+    parse_validation_verdict,
+    verdict_errors,
+)
+from tests.synthetic_data_helpers import make_poem
 
 class ValidationTests(unittest.TestCase):
     def test_extracts_plain_and_fenced_json(self) -> None:
@@ -14,17 +19,47 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(extract_json_object(raw), value)
         self.assertEqual(extract_json_object(f"```json\n{raw}\n```"), value)
 
-    def test_validation_accepts_grounded_result(self) -> None:
-        poem = make_poem()
-        self.assertEqual(validate_generation(valid_value(poem), poem, 80), [])
-
-    def test_validation_catches_wrong_count_and_short_content(self) -> None:
-        poem = make_poem()
-        errors = validate_generation(
-            {"instruction": "بحر الخفيف", "reasoning": "قصير"}, poem, 80
+    def test_pair_extraction_enforces_only_required_string_fields(self) -> None:
+        value = {
+            "instruction": "تعليمات قصيرة بعدد أو بحر خاطئ",
+            "reasoning": "تعليل قصير",
+            "extra": "يبقى لمدقق Gemma أن يرفضه",
+        }
+        self.assertEqual(
+            extract_generated_pair(value),
+            (value["instruction"], value["reasoning"]),
         )
-        self.assertTrue(any("couplet count" in error for error in errors))
-        self.assertTrue(any("at least" in error for error in errors))
+
+    def test_pair_extraction_rejects_missing_or_non_string_fields(self) -> None:
+        with self.assertRaises(ValueError):
+            extract_generated_pair({"instruction": "تعليمات"})
+        with self.assertRaises(ValueError):
+            extract_generated_pair({"instruction": "تعليمات", "reasoning": []})
+
+    def test_parses_strict_gemma_verdict_and_flattens_rejections(self) -> None:
+        raw = json.dumps(
+            {
+                "instruction": {"passed": False, "errors": ["العدد خاطئ"]},
+                "reasoning": {"passed": True, "errors": []},
+            },
+            ensure_ascii=False,
+        )
+        verdict = parse_validation_verdict(raw)
+        self.assertEqual(
+            verdict_errors(verdict),
+            ["Gemma rejected instruction: العدد خاطئ"],
+        )
+
+    def test_rejects_malformed_or_inconsistent_gemma_verdict(self) -> None:
+        malformed = json.dumps(
+            {
+                "instruction": {"passed": True, "errors": ["تناقض"]},
+                "reasoning": {"passed": True, "errors": []},
+            },
+            ensure_ascii=False,
+        )
+        with self.assertRaises(ValueError):
+            parse_validation_verdict(malformed)
 
     def test_response_ends_with_exact_source_poem(self) -> None:
         poem = make_poem()

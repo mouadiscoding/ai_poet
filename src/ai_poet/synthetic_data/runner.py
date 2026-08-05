@@ -14,7 +14,11 @@ from .corpus import load_poems
 from .errors import GemmaConnectionError
 from .generation import TEMPLATE_RATIONALE, generate_one
 from .outputs import append_jsonl, write_jsonl, write_outputs
-from .prompts.families import TEMPLATE_FAMILIES
+from .prompts.templates import (
+    ALL_FOCUS_REQUIREMENTS,
+    PROMPT_TEMPLATES,
+    TEMPLATE_VERSION,
+)
 from .tracing import GenerationTracer, PRINT_LOCK
 
 
@@ -82,6 +86,7 @@ def run(run_settings: RunSettings) -> int:
         sample_id: record
         for sample_id, record in successes.items()
         if sample_id in selected_ids
+        and record.get("template_version") == TEMPLATE_VERSION
     }
     failures = {
         sample_id: error
@@ -130,17 +135,19 @@ def run(run_settings: RunSettings) -> int:
                     "max_network_retries": settings.max_network_retries,
                     "max_repairs": settings.max_repairs,
                 },
-                "meta_template_rationale": TEMPLATE_RATIONALE,
-                "meta_templates": [
+                "template_version": TEMPLATE_VERSION,
+                "template_rationale": TEMPLATE_RATIONALE,
+                "required_focuses": ALL_FOCUS_REQUIREMENTS,
+                "prompt_templates": [
                     {
-                        "template_id": family.template_id,
-                        "focus": family.focus,
+                        "template_id": template.template_id,
+                        "prompt": template.prompt,
                         "why_available": (
-                            "foregrounds this poetic dimension while retaining "
-                            "the shared instruction and reasoning contract"
+                            "supports both metered and prose records and requires "
+                            "all six poetic dimensions"
                         ),
                     }
-                    for family in TEMPLATE_FAMILIES
+                    for template in PROMPT_TEMPLATES
                 ],
                 "checkpoint_note": (
                     "checkpoint_reused counts existing successful records; all "

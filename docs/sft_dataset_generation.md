@@ -96,15 +96,14 @@ silently choosing a label.
 
 ## Few-shot template architecture
 
-### Why meta-templates are used
+### Why concrete templates are used
 
-A small collection of fixed surface instructions would make the SFT corpus
-formulaic. Instead, the implementation uses six *meta-template families*. Each
-family tells Gemma how to study the reference and which aspect to foreground,
-while still requiring every generated instruction to cover all essential
-poetic constraints.
+A single fixed surface instruction would make the SFT corpus formulaic. The
+implementation therefore provides six concrete Arabic templates. Each contains
+a `{poem}` placeholder and changes the order and framing of the analysis while
+requiring all six poetic dimensions in every generated pair.
 
-The families are:
+The templates are:
 
 | Template ID | Primary emphasis |
 | --- | --- |
@@ -115,16 +114,18 @@ The families are:
 | `occasion_addressee` | Occasion, addressee, and communicative purpose |
 | `diction_revision` | Lexicon, syntax, draft alternatives, and revision choices |
 
-The template is selected deterministically from the poem hash. The distribution
-over the current corpus is close to balanced. `prosody_rhyme` is not eligible
-for prose records.
+One template is selected uniformly without a seed at the start of each poem
+generation call and is retained for all repairs in that call. A later rerun of
+an unresolved poem may choose another template. Every template is eligible for
+prose; its form guidance replaces meter and scansion with internal rhythm,
+parallelism, sound, and observable rhyme.
 
 ### True multi-message few-shot prompting
 
 Every final generation request uses this chat sequence:
 
 ```text
-system:    generation rules, JSON contract, and family emphasis
+system:    generation rules, JSON contract, and all six focuses
 user:      demonstration source poem 1
 assistant: demonstration JSON 1
 user:      demonstration source poem 2
@@ -145,11 +146,10 @@ real request:
 ```
 
 Metered templates use two compact metered examples, one on `الطويل` and one on
-`الخفيف`. Prose templates use two separate prose examples. The first example
-teaches the shared contract. The second example is augmented dynamically with
-an instruction and reasoning passage specific to the selected family, so the
-few-shot output itself—not only the system message—demonstrates the desired
-emphasis. The examples teach:
+`الخفيف`. Prose templates use two separate prose examples. Every example
+instruction and reasoning trace demonstrates sound/form, semantic progression,
+imagery/rhetoric, emotion/voice, occasion/addressee, and diction/revision. The
+examples teach:
 
 - The reverse-construction task.
 - Detailed thematic and rhetorical requirements.
@@ -265,20 +265,20 @@ the full corpus consumes substantial terminal and disk space.
 
 The append-only trace assigns a new `run_id` to each invocation and records:
 
-- Run settings, source fingerprint, checkpoint reuse count, all six
-  meta-template definitions, and why meta-templates are used.
-- Per-poem provenance, eligible families, selected family and focus, and the
-  exact `sample_id[8:16]` modulo calculation behind the selection.
+- Run settings, source fingerprint, checkpoint reuse count, template version,
+  the six concrete prompts, and the shared focus contract.
+- Per-poem provenance, all eligible template IDs, the fresh random selection,
+  and why the selected template is retained through repairs.
 - Every request kind: oversized-poem chunk analysis, initial generation, and
-  semantic repair.
+  repair, plus the separate Gemma validation request for each parseable pair.
 - The full OpenAI-compatible request body, including every system, few-shot,
   and final user message, seed, and decoding settings.
 - The complete decoded API response payload. This retains endpoint-provided
   fields such as `message.reasoning_content`, `finish_reason`, and `usage` when
   the server supplies them.
 - Network-attempt counts, retry errors, and elapsed time.
-- Raw response content, parsed JSON, validation errors, and whether a repair is
-  required.
+- Raw generation content, parsed pairs, raw and parsed Gemma verdicts,
+  field-level validation errors, and whether a repair is required.
 - Parsed instruction, Gemma's editorial `reasoning` value, post-processing
   counts, and the final assistant response after the exact source poem is
   appended.
@@ -301,26 +301,33 @@ might appear in request, response, or error text.
 
 ## Response validation and repair
 
-The response parser first attempts to read the entire model response as JSON.
-It also handles a JSON Markdown fence or explanatory text surrounding one JSON
-object. A valid generation must satisfy all of the following:
+The response parser reads the model response as JSON, tolerating a Markdown
+fence or wrapper text around one object. Python only requires extractable
+string `instruction` and `reasoning` values so the pair can be validated and
+stored. It performs no meter, length, language, keyword, copying, or poetic
+quality validation.
 
-- The object has exactly `instruction` and `reasoning`.
-- Both values are strings.
-- Both meet the configured minimum character count.
-- The combined content is predominantly Arabic.
-- The instruction includes the exact numeric couplet count.
-- The instruction names the correct base meter, or requests prose poetry.
-- It does not explicitly name a contradictory meter.
-- It does not copy a complete source hemistich of meaningful length.
-- The reasoning discusses meaning, imagery, and revision.
-- Metered reasoning discusses meter, prosody, or rhythm.
-- The reasoning includes the final-result transition.
+Every parseable pair is sent to the same Gemma model at temperature zero. The
+validation prompt includes the same poem or ordered long-poem summaries used
+for generation, the expected form and numeric count, the minimum lengths, and
+all six focus requirements. Gemma separately evaluates `instruction` and
+`reasoning` for schema, Arabic language, grounding, form, count, comprehensive
+focus coverage, editorial quality, final-result handling, and consistency.
 
-If validation fails, the pipeline sends the original few-shot conversation,
-the invalid response, and a list of concrete validation errors back to Gemma.
-It permits two corrected responses after the initial generation. Network-level
-retries are separate and apply to timeouts, HTTP 429, and HTTP 5xx failures.
+The validator must return exactly:
+
+```json
+{
+  "instruction": {"passed": true, "errors": []},
+  "reasoning": {"passed": true, "errors": []}
+}
+```
+
+Both fields must pass. Gemma rejection reasons are added to the original
+conversation for a complete pair repair, with two corrected responses allowed
+by default. A malformed or inconsistent validation verdict fails the sample
+safely. Network retries are separate and apply to timeouts, HTTP 429, and HTTP
+5xx failures.
 
 ## Checkpoint and resume semantics
 
@@ -337,9 +344,10 @@ or:
 {"status": "failure", "sample_id": "...", "error": "..."}
 ```
 
-On restart, the latest successful record for each sample ID is loaded and
-skipped. Failed or missing IDs are submitted again. A later success supersedes
-an earlier failure.
+On restart, a successful record is reused only when its `template_version` is
+2. Legacy successes without that version are regenerated and remain intact in
+the append-only log. Failed or missing IDs are also submitted again. A later
+success supersedes an earlier failure.
 
 Checkpoint events are written by the main thread after each concurrent task
 finishes, so individual JSON lines are not interleaved. Each successful SFT
@@ -386,15 +394,16 @@ The pipeline writes the same logical records to `ashaar_sft.jsonl` and
 | `meter_id` | Original numeric base-meter class |
 | `meter_name` | Decoded Arabic base-meter name |
 | `couplet_count` | Number of hemistich pairs |
-| `template_id` | Selected meta-template family |
+| `template_id` | Selected concrete prompt template |
+| `template_version` | Prompt and validation contract version; currently `2` |
 | `instruction` | Generated Arabic user instruction |
 | `response` | Generated reasoning plus exact source poem |
 | `messages` | Two-message chat SFT representation |
 | `sft_split` | Stable train, validation, or test assignment |
 | `oversized_for_sft` | Whether chunk analysis was required |
 | `metadata_conflict` | Whether duplicate sources disagreed on meter |
-| `generation_attempts` | Initial generation plus semantic repairs |
-| `validation_status` | `passed` or `passed_after_repair` |
+| `generation_attempts` | Initial generation plus format or Gemma-requested repairs |
+| `validation_status` | Gemma validation `passed` or `passed_after_repair` |
 
 `messages` contains:
 
@@ -477,17 +486,17 @@ uv run python -m unittest discover -s tests -v
 
 It covers:
 
-- All six few-shot message layouts.
-- The separate prose examples.
+- Rendering and fresh random selection of all six concrete templates.
+- Comprehensive metered and prose few-shot examples.
 - Meter decoding and invalid IDs.
 - Exact hemistich pairing.
-- Stable hashes, template selection, and splits.
+- Stable hashes and splits.
 - Deduplication and majority conflict resolution.
 - JSON and fenced-JSON extraction.
-- Semantic validation and repair.
+- Strict Gemma verdict parsing, rejection feedback, and repair.
 - Exact source-poem preservation.
 - Oversized-poem summaries and synthesis.
-- Checkpoint loading.
+- Template-version-aware checkpoint reuse.
 - JSONL and Parquet round trips.
 
 Before a full production run is accepted, verify that:
@@ -503,9 +512,10 @@ Before a full production run is accepted, verify that:
 ## Known limitations
 
 - The base-meter label does not prove a specific metrical form.
-- Semantic and rhetorical descriptions are model-generated and can still be
-  wrong despite deterministic validation.
-- The validator detects structural contradictions, not full Arabic scansion.
+- Semantic and rhetorical descriptions and their quality verdicts come from
+  the same Gemma model, so correlated mistakes remain possible.
+- Gemma validation is not a substitute for expert Arabic scansion or manual
+  review, and it adds one model request for every parseable generation attempt.
 - Chunk summaries lose some local detail in extremely long poems.
 - Long reasoning increases storage and training-token cost substantially.
 - Keeping all oversized poems in the master data does not make them trainable
