@@ -84,7 +84,7 @@ context-size controls.
 
 Every completed request is appended immediately to
 `generation_checkpoint.jsonl`. Re-running the same command skips successful
-template-version-2 sample IDs and retries unresolved or legacy successes.
+template-version-4 sample IDs and retries unresolved or legacy successes.
 Transient HTTP failures are retried
 up to three times with exponential backoff. Connection failures use the same
 backoff and stop the entire script if Gemma is still unreachable after the

@@ -59,17 +59,27 @@ defines six complete, renderable prompt templates:
 | `occasion_addressee` | Occasion, addressee, and communicative purpose |
 | `diction_revision` | Diction, syntax, alternatives, and revision |
 
-Every template contains a literal `{poem}` placeholder plus placeholders for
-the form, numeric unit count, and minimum field length. The templates vary the
-order and framing of the analysis, but every one explicitly requires all six
-dimensions: sound/form, semantic progression, imagery/rhetoric, emotion/voice,
-occasion/addressee, and diction/revision.
+Every entry is an independently authored, complete prompt rather than a focus
+fragment inserted into a shared skeleton. All six use exactly the same seven
+placeholders: `{meter_name}`, `{couplet_count}`, `{minimum_chars}`,
+`{form_guidance}`, `{meter_explanation}`, `{plan_heading}`, and `{poem}`. Their
+workflows and layouts differ, but every one contains the full task, grounding
+rules, six-dimension requirements, required instruction layout, and JSON
+response contract.
 
-[`choose_template()`](../src/ai_poet/synthetic_data/assignment.py) makes a fresh
-uniform random choice once per poem-generation call. Repairs retain that
-choice; rerunning an unresolved poem may choose another template. All six are
-eligible for prose, where prosody is adapted to internal rhythm, parallelism,
-sound, and observable rhyme rather than a classical meter.
+`METER_DEFINITIONS` in the same module covers every supported meter plus
+`النثر`. Each entry stores a technical definition, the base full-verse pattern,
+and an approximate long/short syllable pattern. `build_messages()` renders the
+selected entry into `{meter_explanation}`. The definitions and base patterns
+follow Ahmad al-Hashimi's *Mizan al-Dhahab fi Sina'at Shi'r al-Arab*; legitimate
+zihaf and `illa` changes remain allowed. Prose explicitly has no Khalilian
+weight and uses internal rhythm instead.
+
+[`generate_one()`](../src/ai_poet/synthetic_data/generation.py) makes a fresh
+uniform random choice once per poem-generation call. Repairs retain that choice;
+rerunning an unresolved poem may choose another template. All six are eligible
+for prose, where prosody is adapted to internal rhythm, parallelism, sound, and
+observable rhyme rather than a classical meter.
 
 ## 3. Few-shot prompt construction
 
@@ -77,12 +87,12 @@ sound, and observable rhyme rather than a classical meter.
 a six-message conversation for each poem:
 
 ```text
-system:    generation policy, JSON contract, and all six focuses
+system:    generation policy and few-shot response conventions
 user:      demonstration source poem 1
 assistant: demonstration JSON 1
 user:      demonstration source poem 2
 assistant: demonstration JSON 2
-user:      actual source poem or long-poem analysis notes
+user:      complete rendered template with source poem or analysis notes
 ```
 
 The system prompt requires the model to:
@@ -103,11 +113,15 @@ There are separate example banks for
 [`PROSE_FEW_SHOTS`](../src/ai_poet/synthetic_data/prompts/examples.py). Every
 example instruction and reasoning trace demonstrates all six focuses. The
 prose demonstrations replace metrical scansion with internal rhythm and avoid
-inventing a classical meter.
+inventing a classical meter. Every demonstration also uses the required
+instruction-section order.
 
-The final user message provides only the material needed for generation:
+The final user message is the selected complete template. In addition to its
+own workflow, six-focus requirements, grounding rules, and output contract, it
+provides:
 
 - The base meter, or the prose marker.
+- The injected definition, full-verse weight, and approximate sound pattern.
 - The exact number of couplets or prose units.
 - The formatted source poem.
 - For an oversized poem, ordered summaries in place of the full source text.
@@ -133,7 +147,8 @@ obtain `instruction` and `reasoning`; it does not judge their poetic content.
 
 Every parseable pair is sent to Gemma in a separate zero-temperature validation
 request together with the same reference material, expected form, exact unit
-count, minimum lengths, and six-focus contract. Gemma returns separate
+count, minimum lengths, required heading order, meter reference, and six-focus
+contract. Gemma returns separate
 `passed`/`errors` verdicts for `instruction` and `reasoning`, and both must pass.
 It checks schema, Arabic language, grounding, correct form and count, all six
 focuses, instruction quality, editorial reasoning quality, and cross-field
@@ -209,7 +224,7 @@ own context-length policy.
 
 [`run()`](../src/ai_poet/synthetic_data/runner.py) processes pending poems
 concurrently and checkpoints every success or failure. Existing successful
-sample IDs are skipped on resume only when their `template_version` is `2`;
+sample IDs are skipped on resume only when their `template_version` is `4`;
 older records remain in the append-only checkpoint and are regenerated.
 
 [`write_outputs()`](../src/ai_poet/synthetic_data/outputs.py) orders successful

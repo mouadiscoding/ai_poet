@@ -99,9 +99,19 @@ silently choosing a label.
 ### Why concrete templates are used
 
 A single fixed surface instruction would make the SFT corpus formulaic. The
-implementation therefore provides six concrete Arabic templates. Each contains
-a `{poem}` placeholder and changes the order and framing of the analysis while
-requiring all six poetic dimensions in every generated pair.
+implementation therefore provides six independently authored, complete Arabic
+templates. Each uses the same placeholders for meter, count, minimum length,
+form guidance, meter explanation, composition-plan heading, and source poem.
+Each also carries the full task, grounding rules, six poetic dimensions,
+required instruction layout, and output contract, while changing the workflow
+and structure used to express them.
+
+`METER_DEFINITIONS` covers all 16 classical meters and the corpus's prose
+category. Each entry provides a definition, base full-verse weight, and an
+approximate long/short sound pattern. These data are injected into the selected
+template; prose receives an explicit non-applicable weight and internal-rhythm
+guidance. The base patterns follow Ahmad al-Hashimi's *Mizan al-Dhahab fi
+Sina'at Shi'r al-Arab*, while valid zihaf and `illa` variants remain allowed.
 
 The templates are:
 
@@ -125,12 +135,12 @@ parallelism, sound, and observable rhyme.
 Every final generation request uses this chat sequence:
 
 ```text
-system:    generation rules, JSON contract, and all six focuses
+system:    generation policy and few-shot response conventions
 user:      demonstration source poem 1
 assistant: demonstration JSON 1
 user:      demonstration source poem 2
 assistant: demonstration JSON 2
-user:      the actual source poem or the oversized-poem analysis notes
+user:      the complete rendered template with source poem or analysis notes
 ```
 
 This is few-shot prompting at the chat-message level, rather than embedding an
@@ -157,6 +167,7 @@ examples teach:
 - Appropriate prosodic language.
 - Drafting and revision discussion.
 - The exact JSON response contract.
+- The exact ordered instruction headings and seven-step composition plan.
 - Ending the reasoning with `النتيجة النهائية:` while omitting the consolidated
   final poem.
 
@@ -167,7 +178,17 @@ from the actual poem.
 ### Actual instruction requirements
 
 The system and final user messages tell Gemma that every generated instruction
-must cover:
+must use these sections in order:
+
+1. `الموضوع العام:`
+2. `الجو العاطفي المطلوب:`
+3. `ألفاظ وصور يُستحسن استعمالها أو الدوران حولها:`
+4. `القافية:`
+5. `شرح البحر المطلوب:` including `وزنه في كل بيت كامل:`
+6. `الصورة الصوتية التقريبية:`
+7. A meter-specific practical composition plan; prose receives a prose plan.
+
+Across those sections it must cover:
 
 - The exact number of couplets, written in digits.
 - The base meter or an explicit prose-poetry requirement.
@@ -345,7 +366,7 @@ or:
 ```
 
 On restart, a successful record is reused only when its `template_version` is
-2. Legacy successes without that version are regenerated and remain intact in
+4. Legacy successes without that version are regenerated and remain intact in
 the append-only log. Failed or missing IDs are also submitted again. A later
 success supersedes an earlier failure.
 
@@ -395,7 +416,7 @@ The pipeline writes the same logical records to `ashaar_sft.jsonl` and
 | `meter_name` | Decoded Arabic base-meter name |
 | `couplet_count` | Number of hemistich pairs |
 | `template_id` | Selected concrete prompt template |
-| `template_version` | Prompt and validation contract version; currently `2` |
+| `template_version` | Prompt and validation contract version; currently `4` |
 | `instruction` | Generated Arabic user instruction |
 | `response` | Generated reasoning plus exact source poem |
 | `messages` | Two-message chat SFT representation |

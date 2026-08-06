@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import unittest
-from unittest.mock import patch
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from ai_poet.synthetic_data.assignment import choose_template, sft_split
+from ai_poet.synthetic_data.assignment import sft_split
 from ai_poet.synthetic_data.corpus import load_poems
 from ai_poet.synthetic_data.meters import meter_name
 from ai_poet.synthetic_data.poems import format_poem, poem_hash, split_poem_chunks
@@ -24,16 +23,10 @@ class CorpusTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             format_poem(("شطر وحيد",))
 
-    def test_hash_split_is_stable_and_template_choice_is_random(self) -> None:
+    def test_hash_and_split_are_stable(self) -> None:
         poem = make_poem()
         self.assertEqual(poem_hash(poem.verses), poem.sample_id)
         self.assertEqual(sft_split(poem.sample_id), sft_split(poem.sample_id))
-        with patch(
-            "ai_poet.synthetic_data.assignment.random.choice",
-            side_effect=lambda templates: templates[4],
-        ) as choice:
-            self.assertEqual(choose_template().template_id, "occasion_addressee")
-        choice.assert_called_once()
 
     def test_chunks_preserve_couplet_boundaries(self) -> None:
         verses = ("أ" * 10, "ب" * 10, "ج" * 10, "د" * 10)

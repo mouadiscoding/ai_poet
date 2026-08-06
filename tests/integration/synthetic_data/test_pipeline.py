@@ -146,15 +146,15 @@ class PipelineTests(unittest.TestCase):
             [candidate, rejection, candidate, json.dumps(valid_verdict(), ensure_ascii=False)]
         )
         with patch(
-            "ai_poet.synthetic_data.generation.choose_template",
+            "ai_poet.synthetic_data.generation.random.choice",
             return_value=PROMPT_TEMPLATES[2],
-        ) as choose:
+        ) as choice:
             record = generate_one(poem, client, settings())
 
         self.assertEqual(record["generation_attempts"], 2)
         self.assertEqual(record["template_id"], "imagery_rhetoric")
         self.assertIn("لم يذكر المخاطَب بوضوح", client.calls[2][-1]["content"])
-        choose.assert_called_once()
+        choice.assert_called_once_with(PROMPT_TEMPLATES)
 
     def test_malformed_gemma_verdict_is_never_exported(self) -> None:
         poem = make_poem()

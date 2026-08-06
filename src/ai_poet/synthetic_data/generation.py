@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import json
+import random
 from typing import Any
 
-from .assignment import choose_template, sft_split
+from .assignment import sft_split
 from .client import GemmaClient
 from .config import GenerationSettings
 from .errors import GenerationError
@@ -129,7 +130,7 @@ def generate_one(
             invalid after the configured number of repair attempts.
         ValueError: If chunk settings or poem formatting invariants are invalid.
     """
-    template = choose_template()
+    template = random.choice(PROMPT_TEMPLATES)
     _emit_client_trace(
         client,
         {

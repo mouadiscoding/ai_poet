@@ -1,10 +1,6 @@
-"""Dataset-split assignment and random prompt-template selection."""
+"""Deterministic dataset-split assignment."""
 
 from __future__ import annotations
-
-import random
-
-from .prompts.templates import PROMPT_TEMPLATES, PromptTemplate
 
 
 def sft_split(sample_id: str) -> str:
@@ -31,13 +27,3 @@ def sft_split(sample_id: str) -> str:
     if bucket == 98:
         return "validation"
     return "test"
-
-
-def choose_template() -> PromptTemplate:
-    """Choose one concrete prompt template uniformly for a generation run.
-
-    Selection deliberately has no content-derived seed. A repair within the
-    same generation call retains the selected template, while a later rerun of
-    an unresolved poem may choose another template.
-    """
-    return random.choice(PROMPT_TEMPLATES)

@@ -34,7 +34,7 @@ def build_parser() -> ArgumentParser:
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--timeout", type=float, default=300.0)
     parser.add_argument("--max-network-retries", type=int, default=3)
-    parser.add_argument("--max-repairs", type=int, default=2)
+    parser.add_argument("--max-repairs", type=int, default=5)
     parser.add_argument("--temperature", type=float, default=0.4)
     parser.add_argument("--top-p", type=float, default=0.9)
     parser.add_argument("--max-tokens", type=int, default=4096)

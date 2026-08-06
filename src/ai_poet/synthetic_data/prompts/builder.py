@@ -6,16 +6,22 @@ import json
 from typing import Any
 
 from .examples import FewShot, METERED_FEW_SHOTS, PROSE_FEW_SHOTS
-from .templates import ALL_FOCUS_REQUIREMENTS, PromptTemplate
+from .templates import (
+    ALL_FOCUS_REQUIREMENTS,
+    PromptTemplate,
+    meter_explanation,
+    plan_heading,
+)
 
 
 SYSTEM_PROMPT = """أنت تبني بيانات تدريب إشرافي لشاعر عربي. مهمتك عكسية: تتلقى قصيدة مرجعية، ثم تكتب تعليمات مفصلة كان يمكن أن تؤدي إليها، وتعليلًا تحريريًا طويلًا يشرح صناعة النص. التزم بالحقائق الظاهرة في المرجع ولا تنسب النص إلى شاعره ولا تذكر عنوانه أو رابطه في التعليمات. لا تنسخ شطرًا كاملًا داخل التعليمات، ويجوز ذكر ألفاظ مفردة تخدم القافية أو الصورة.
 
-اسم البحر المعطى هو البحر الأساس فقط. لا تدّع أن الصورة تامة أو مجزوءة أو مشطورة، ولا تسرد تفعيلات مخصوصة إن لم تكن الصورة مثبتة. عند البحر «النثر» صرّح بعدم طلب الوزن الخليلي واستبدله بالإيقاع الداخلي.
+اسم البحر المعطى هو البحر الأساس. ستتلقى في القالب تعريفه ووزنه الأصلي؛ انقلهما إلى instruction ولا تستبدلهما بتخمين. اذكر أن الزحافات والعلل الصحيحة قد تغير الصورة الأصلية، ولا تدّع أن النص المرجعي تام أو مجزوء أو مشطور ما لم يثبت ذلك. عند «النثر» صرّح بعدم وجود وزن خليلي واستبدله بالإيقاع الداخلي.
 
 أعد كائن JSON صحيحًا فقط، بلا سياج Markdown، وبمفتاحين نصيين لا غير: "instruction" و"reasoning". يجب أن يكون كل حقل طويلًا ومفصلًا ولا يقل عن {minimum_chars} محرفًا في المهمة الفعلية. الأمثلة التالية مختصرة نسبيًا لاقتصاد السياق. يجب أن يتضمن التعليل مرحلة تفكير وتحرير بصيغة المتكلم، وأن ينتهي بعبارة «النتيجة النهائية:» من غير أن يورد القصيدة النهائية مجتمعة؛ سيضيفها البرنامج حرفيًا.
 
-لا يختص أي قالب بمحور واحد؛ يجب أن تراعي كل نتيجة المحاور الآتية كلها:
+القالب الفعلي في آخر المحادثة مكتف بذاته؛ اتبع بنيته وتعليماته كلها عند إنشاء النتيجة.
+يجب أن يبدأ حقل instruction مباشرة بعنوان «الموضوع العام:» وأن يحافظ على ترتيب العناوين الذي يحدده القالب.
 """
 
 
@@ -35,8 +41,9 @@ def form_guidance(meter_name: str) -> str:
             "والتوازي والجرس والقافية الظاهرة إن وجدت"
         )
     return (
-        f"سمّ بحر {meter_name} بوصفه البحر الأساس، وافحص الوزن والنطق العروضي "
-        "والقافية من غير ادعاء صورة عروضية أو تفعيلات غير مثبتة"
+        f"سمّ بحر {meter_name} بوصفه البحر الأساس، واشرح وزنه الأصلي المقدم، "
+        "وافحص النطق العروضي والقافية مع قبول الزحافات والعلل الصحيحة من غير "
+        "ادعاء صورة تامة أو مجزوءة لا يثبتها المرجع"
     )
 
 
@@ -72,10 +79,7 @@ def build_messages(
     messages: list[dict[str, str]] = [
         {
             "role": "system",
-            "content": (
-                SYSTEM_PROMPT.format(minimum_chars=minimum_chars)
-                + ALL_FOCUS_REQUIREMENTS
-            ),
+            "content": SYSTEM_PROMPT.format(minimum_chars=minimum_chars),
         }
     ]
     for example in examples:
@@ -94,6 +98,8 @@ def build_messages(
                 couplet_count=couplet_count,
                 minimum_chars=minimum_chars,
                 form_guidance=form_guidance(meter_name),
+                meter_explanation=meter_explanation(meter_name),
+                plan_heading=plan_heading(meter_name),
                 poem=poem,
             ),
         }
@@ -112,10 +118,15 @@ def build_validation_messages(
     """Build the Gemma-only quality-validation request for a candidate pair."""
     instruction = candidate["instruction"]
     reasoning = candidate["reasoning"]
+    expected_meter_explanation = meter_explanation(meter_name)
+    expected_plan_heading = plan_heading(meter_name)
     criteria = f"""المطلوب من المدقق:
 - افحص أن الكائن المرشح لا يحتوي إلا instruction وreasoning وأن كليهما نص عربي صالح.
 - افحص أن طول كل حقل لا يقل عن {minimum_chars} محرفًا؛ الطول المحسوب لـ instruction هو {len(instruction)} ولـ reasoning هو {len(reasoning)}.
 - افحص ذكر العدد {couplet_count} بالأرقام في instruction والالتزام بضابط الشكل الآتي: {form_guidance(meter_name)}.
+- افحص أن instruction يبدأ مباشرة بعنوان «الموضوع العام:»، وأن عناوينه تأتي بالترتيب الآتي من غير تقديم أو تأخير: «الموضوع العام:»، «الجو العاطفي المطلوب:»، «ألفاظ وصور يُستحسن استعمالها أو الدوران حولها:»، «القافية:»، «شرح البحر المطلوب:»، «الصورة الصوتية التقريبية:»، «{expected_plan_heading}».
+- افحص أن instruction يذكر اسم البحر «{meter_name}»، وأن قسم شرح البحر يضم تعريف البحر والعبارة «وزنه في كل بيت كامل:»، وأن قسم الصورة الصوتية يطابق المرجع العروضي الآتي ولا يخترع تفعيلات:
+{expected_meter_explanation}
 - افحص استناد الحقلين إلى المرجع، وعدم اختلاق مناسبة أو مخاطَب أو تفاصيل عروضية، وعدم نسخ شطر مرجعي كامل في instruction.
 - افحص في كل حقل تغطية المحاور الستة بوضوح وبما يلائم المرجع:
 {ALL_FOCUS_REQUIREMENTS}
