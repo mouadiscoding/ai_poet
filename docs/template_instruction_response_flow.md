@@ -1,27 +1,36 @@
 # How templates become instruction-response pairs
 
-The SFT pipeline performs a reverse-generation task: it starts with an existing
-poem, asks Gemma to infer a detailed writing instruction and editorial
-rationale, and then converts those generated fields into a two-message
-supervised fine-tuning example.
+The pipeline starts from an existing poem and produces a two-message SFT pair.
+Instruction reconstruction and editorial-work reconstruction are deliberately
+separate so that the latter cannot drift into explaining how the dataset fields
+were created.
 
 ```text
 Source poem
    |
    v
-Choose a concrete template randomly
+Choose one instruction template
    |
    v
-Build a six-message few-shot prompt
+Gemma generates {instruction}
+   |
+   +--> deterministic instruction checks
+   +--> Gemma instruction-quality review
    |
    v
-Gemma returns {instruction, reasoning}
+Split the poem into groups of at most three couplets
    |
    v
-Validate and, if necessary, repair the result
+Gemma generates {overview?, verse_reasoning[]} for each group
+   |
+   +--> deterministic source-linked checks
+   +--> Gemma chunk-quality review
    |
    v
-Append the exact source poem to the reasoning
+Render the validated work blocks
+   |
+   v
+Append one canonical result marker and the exact source poem
    |
    v
 Store {user: instruction, assistant: response}
@@ -29,209 +38,156 @@ Store {user: instruction, assistant: response}
 
 ## 1. Source preparation
 
-[`download_ashaar.py`](../download_ashaar.py) only downloads the Ashaar dataset
-and writes it to Parquet. It does not use the prompt templates.
+[`load_poems()`](../src/ai_poet/synthetic_data/corpus.py) reads alternating
+hemistichs from the source dataset. Each adjacent pair becomes one canonical
+line in the form `صدر = عجز`. Identical verse sequences are deduplicated while
+their provenance is retained.
 
-[`load_poems()`](../src/ai_poet/synthetic_data/corpus.py) reads the Parquet file
-and:
-
-- Treats `poem_verses` as alternating hemistichs.
-- Formats each pair as `first hemistich = second hemistich`.
-- Deduplicates identical verse sequences.
-- Resolves meter metadata, including duplicate rows with conflicting labels.
-- Computes a content-based SHA-256 `sample_id`.
-
-Consequently, each unique poem normally produces exactly one training pair.
-Duplicate source rows retain their provenance but do not create duplicate
-targets.
-
-## 2. Concrete templates
+## 2. Instruction generation
 
 [`prompts/templates.py`](../src/ai_poet/synthetic_data/prompts/templates.py)
-defines six complete, renderable prompt templates:
+contains six independently worded templates emphasizing prosody, semantic arc,
+imagery, voice, occasion, or diction. Every template still covers all six
+dimensions and produces one JSON field:
 
-| Template ID | Main emphasis |
-| --- | --- |
-| `prosody_rhyme` | Meter, rhyme, recitation, and sound |
-| `semantic_arc` | Meaning progression and poem-level unity |
-| `imagery_rhetoric` | Imagery and rhetorical devices |
-| `emotion_voice` | Emotional register, speaker, and tone |
-| `occasion_addressee` | Occasion, addressee, and communicative purpose |
-| `diction_revision` | Diction, syntax, alternatives, and revision |
-
-Every entry is an independently authored, complete prompt rather than a focus
-fragment inserted into a shared skeleton. All six use exactly the same seven
-placeholders: `{meter_name}`, `{couplet_count}`, `{minimum_chars}`,
-`{form_guidance}`, `{meter_explanation}`, `{plan_heading}`, and `{poem}`. Their
-workflows and layouts differ, but every one contains the full task, grounding
-rules, six-dimension requirements, required instruction layout, and JSON
-response contract.
-
-`METER_DEFINITIONS` in the same module covers every supported meter plus
-`النثر`. Each entry stores a technical definition, the base full-verse pattern,
-and an approximate long/short syllable pattern. `build_messages()` renders the
-selected entry into `{meter_explanation}`. The definitions and base patterns
-follow Ahmad al-Hashimi's *Mizan al-Dhahab fi Sina'at Shi'r al-Arab*; legitimate
-zihaf and `illa` changes remain allowed. Prose explicitly has no Khalilian
-weight and uses internal rhythm instead.
-
-[`generate_one()`](../src/ai_poet/synthetic_data/generation.py) makes a fresh
-uniform random choice once per poem-generation call. Repairs retain that choice;
-rerunning an unresolved poem may choose another template. All six are eligible
-for prose, where prosody is adapted to internal rhythm, parallelism, sound, and
-observable rhyme rather than a classical meter.
-
-## 3. Few-shot prompt construction
-
-[`build_messages()`](../src/ai_poet/synthetic_data/prompts/builder.py) constructs
-a six-message conversation for each poem:
-
-```text
-system:    generation policy and few-shot response conventions
-user:      demonstration source poem 1
-assistant: demonstration JSON 1
-user:      demonstration source poem 2
-assistant: demonstration JSON 2
-user:      complete rendered template with source poem or analysis notes
+```json
+{"instruction": "<detailed Arabic writing request>"}
 ```
 
-The system prompt requires the model to:
+[`build_messages()`](../src/ai_poet/synthetic_data/prompts/builder.py) combines
+the chosen template with two form-appropriate instruction demonstrations. The
+instruction must use the configured section order, numeric couplet count, and
+trusted meter definition. It must not quote a complete source hemistich or
+invent unsupported context.
 
-- Reverse-construct an instruction from the reference poem.
-- Return only JSON with the keys `instruction` and `reasoning`.
-- Use the correct meter and numeric couplet count.
-- Avoid mentioning the source poet, title, or URL.
-- Avoid copying a complete source hemistich into the instruction.
-- Produce a long editorial rationale about meaning, imagery, drafting, and
-  revision.
-- Discuss meter and rhyme when the source is metered.
-- End the reasoning with `النتيجة النهائية:`.
-- Omit the complete final poem because the program will append it itself.
+Python rejects malformed instructions, missing or reordered headings, a missing
+numeric count or meter, insufficient length, and complete source-hemistich
+copies. Gemma then performs a separate semantic review. Only the instruction is
+regenerated when this phase fails.
 
-There are separate example banks for
-[`METERED_FEW_SHOTS`](../src/ai_poet/synthetic_data/prompts/examples.py) and
-[`PROSE_FEW_SHOTS`](../src/ai_poet/synthetic_data/prompts/examples.py). Every
-example instruction and reasoning trace demonstrates all six focuses. The
-prose demonstrations replace metrical scansion with internal rhythm and avoid
-inventing a classical meter. Every demonstration also uses the required
-instruction-section order.
+## 3. Verse-level editorial work
 
-The final user message is the selected complete template. In addition to its
-own workflow, six-focus requirements, grounding rules, and output contract, it
-provides:
+[`build_reasoning_messages()`](../src/ai_poet/synthetic_data/prompts/builder.py)
+receives the validated instruction and no more than three exact target couplets.
+Its metered few-shot is a multi-verse drafting demonstration; prose uses a
+parallel example based on internal rhythm.
 
-- The base meter, or the prose marker.
-- The injected definition, full-verse weight, and approximate sound pattern.
-- The exact number of couplets or prose units.
-- The formatted source poem.
-- For an oversized poem, ordered summaries in place of the full source text.
-
-Poet, title, and URL metadata are retained for provenance in the output record,
-but are not supplied as content for the generated instruction.
-
-## 4. Model generation and validation
-
-[`generate_one()`](../src/ai_poet/synthetic_data/generation.py) sends the
-few-shot conversation to the OpenAI-compatible Gemma endpoint. The expected
-result is a JSON object:
+The first chunk returns a poem-level `overview`; every chunk returns one object
+per target couplet:
 
 ```json
 {
-  "instruction": "A detailed Arabic poetry-writing request",
-  "reasoning": "A synthetic Arabic editorial rationale"
-}
-```
-
-Python performs only the JSON extraction and string-type checks required to
-obtain `instruction` and `reasoning`; it does not judge their poetic content.
-
-Every parseable pair is sent to Gemma in a separate zero-temperature validation
-request together with the same reference material, expected form, exact unit
-count, minimum lengths, required heading order, meter reference, and six-focus
-contract. Gemma returns separate
-`passed`/`errors` verdicts for `instruction` and `reasoning`, and both must pass.
-It checks schema, Arabic language, grounding, correct form and count, all six
-focuses, instruction quality, editorial reasoning quality, and cross-field
-consistency. A rejection becomes repair feedback in the original generation
-conversation. A malformed validator response fails the sample safely instead
-of approving it. Network retries remain separate.
-
-## 5. Forming the final instruction-response pair
-
-The generated `instruction` becomes the training user message directly. The
-generated `reasoning` is not used unchanged.
-
-[`compose_response()`](../src/ai_poet/synthetic_data/responses.py) removes:
-
-- Any complete source poem echoed by the model.
-- Standalone source couplets or hemistichs.
-- Duplicate final-result markers.
-- Standalone headers such as `القصيدة النهائية:`.
-
-It then constructs the assistant response in one invariant order:
-
-```text
-<cleaned model-generated editorial reasoning>
-
-النتيجة النهائية:
-
-<exact original poem>
-```
-
-The poem is appended from the source record rather than copied from the model's
-answer. This prevents the target poem from being rewritten, normalized,
-re-diacritized, or hallucinated by the generation endpoint.
-
-The successful record assembled in
-[`generate_one()`](../src/ai_poet/synthetic_data/generation.py) contains both
-flat fields and a chat-format representation:
-
-```json
-{
-  "instruction": "<generated instruction>",
-  "response": "<cleaned reasoning plus exact source poem>",
-  "messages": [
+  "overview": "<present only for the first chunk>",
+  "verse_reasoning": [
     {
-      "role": "user",
-      "content": "<generated instruction>"
-    },
-    {
-      "role": "assistant",
-      "content": "<cleaned reasoning plus exact source poem>"
+      "verse_index": 1,
+      "intended_meaning": "...",
+      "connection_to_previous": "...",
+      "imagery_and_diction": "...",
+      "first_draft": "... = ...",
+      "problem_with_first_draft": "...",
+      "revised_draft": "<exact target couplet>",
+      "first_hemistich_scansion": "...",
+      "second_hemistich_scansion": "...",
+      "rhyme_check": "..."
     }
   ]
 }
 ```
 
-The six-message template conversation is generation-time scaffolding only. The
-exported SFT example is the final two-message instruction-response
-conversation.
+The content is an explicit synthetic editorial reconstruction. It is not
+presented as access to the historical poet's private thoughts.
 
-## 6. Oversized poems
+## 4. Deterministic and semantic validation
 
-When a poem exceeds the configured direct-source limit,
-[`_chunk_analysis()`](../src/ai_poet/synthetic_data/generation.py) divides it at
-complete-couplet boundaries and requests a compact analysis for each chunk.
-The ordered summaries replace the full source poem in both the main generation
-prompt and its Gemma validation prompt.
+[`validation.py`](../src/ai_poet/synthetic_data/validation.py) rejects a
+reasoning chunk unless:
 
-This still produces one instruction-response pair for the complete poem. The
-complete original poem is appended to the assistant response, and the record is
-marked with `oversized_for_sft=true` so downstream training code can apply its
-own context-length policy.
+- It has exactly the requested keys and number of blocks.
+- Verse indices are contiguous and in source order.
+- Every required field is a non-empty string.
+- Each `revised_draft` exactly matches its source couplet.
+- Each `first_draft` differs from the accepted version.
+- Pre-draft imagery and diction are expressed as a plan, not as retrospective
+  claims about wording that has not appeared yet.
+- The content contains no instruction-generation metatext such as references to
+  fields, character counts, or building the `instruction`.
 
-## 7. Checkpointing and exports
+Gemma then judges whether the meaning, alternative draft, rejection reason,
+concrete revision decision, and rhyme discussion are chronological and
+plausible. Python checks that both
+scansion fields exist and are substantive, but omits them from the semantic
+review: Gemma is not used as a hard gate for exact Arabic scansion. A rejected
+chunk is repaired independently; already accepted chunks are not regenerated.
+A malformed validator response fails safely.
 
-[`run()`](../src/ai_poet/synthetic_data/runner.py) processes pending poems
-concurrently and checkpoints every success or failure. Existing successful
-sample IDs are skipped on resume only when their `template_version` is `4`;
-older records remain in the append-only checkpoint and are regenerated.
+## 5. Rendering the assistant response
 
-[`write_outputs()`](../src/ai_poet/synthetic_data/outputs.py) orders successful
-records by source order and writes them to:
+[`render_reasoning()`](../src/ai_poet/synthetic_data/responses.py) turns the
+validated objects into Arabic sections such as:
 
-- `ashaar_sft.jsonl`
-- `ashaar_sft.parquet`
+```text
+مرحلة التفكير والتحرير:
 
-It also writes unresolved failures and a manifest containing generation
-settings, template distribution, dataset split counts, and quality flags.
+<overview>
+
+البيت 1:
+
+المعنى المقصود:
+...
+
+خطة الصورة والمعجم:
+...
+
+صياغة أولى:
+...
+
+قرار المراجعة:
+...
+
+الصياغة المنقحة:
+...
+
+فحص الصدر عروضيًا:
+...
+```
+
+[`compose_response()`](../src/ai_poet/synthetic_data/responses.py) preserves
+source couplets quoted in these validated work blocks. It discards anything
+after an accidental result marker and removes only a leading or explicitly
+labeled accidental full-poem dump. It then appends one canonical section:
+
+```text
+النتيجة النهائية:
+
+<exact source poem>
+```
+
+The exported record keeps the existing trainer-facing contract:
+
+```json
+{
+  "instruction": "<generated instruction>",
+  "response": "<rendered worklog plus exact poem>",
+  "messages": [
+    {"role": "user", "content": "<generated instruction>"},
+    {"role": "assistant", "content": "<rendered worklog plus exact poem>"}
+  ]
+}
+```
+
+The structured objects and raw model exchanges remain generation-time or trace
+data; they are not added to the SFT message schema.
+
+## 6. Long poems and checkpoint compatibility
+
+Reasoning is always generated in groups of at most three couplets, independent
+of source length. For source poems above the configured direct-source limit,
+[`_chunk_analysis()`](../src/ai_poet/synthetic_data/generation.py) additionally
+creates ordered summaries for the global instruction stage. Exact couplets,
+not summaries, are still used by the verse-work stage.
+
+Template version `5` invalidates older checkpoint successes so they are
+regenerated under the verse-level contract. Successful records include total,
+instruction, and reasoning generation-attempt counts plus the reasoning chunk
+count.

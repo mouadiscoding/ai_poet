@@ -1,55 +1,92 @@
-"""Compose trusted SFT responses from generated reasoning and source poems."""
+"""Render structured editorial work and compose trusted SFT responses."""
 
 from __future__ import annotations
 
 import re
+from typing import Any, Sequence
 
 from .poems import PoemRecord
 
 
+def render_reasoning(
+    overview: str,
+    verse_reasoning: Sequence[dict[str, Any]],
+    *,
+    is_prose: bool,
+) -> str:
+    """Render validated verse-work blocks as readable Arabic editorial prose."""
+    unit_name = "الوحدة" if is_prose else "البيت"
+    first_sound_label = "فحص إيقاع الجزء الأول" if is_prose else "فحص الصدر عروضيًا"
+    second_sound_label = "فحص إيقاع الجزء الثاني" if is_prose else "فحص العجز عروضيًا"
+    rhyme_label = "فحص الجرس" if is_prose else "فحص القافية"
+
+    sections = ["مرحلة التفكير والتحرير:", "", overview.strip()]
+    for block in verse_reasoning:
+        sections.extend(
+            [
+                "",
+                f"{unit_name} {block['verse_index']}:",
+                "",
+                "المعنى المقصود:",
+                block["intended_meaning"],
+                "",
+                "صلته بما قبله:",
+                block["connection_to_previous"],
+                "",
+                "خطة الصورة والمعجم:",
+                block["imagery_and_diction"],
+                "",
+                "صياغة أولى:",
+                block["first_draft"],
+                "",
+                "قرار المراجعة:",
+                block["problem_with_first_draft"],
+                "",
+                "الصياغة المنقحة:",
+                block["revised_draft"],
+                "",
+                f"{first_sound_label}:",
+                block["first_hemistich_scansion"],
+                "",
+                f"{second_sound_label}:",
+                block["second_hemistich_scansion"],
+                "",
+                f"{rhyme_label}:",
+                block["rhyme_check"],
+            ]
+        )
+    return "\n".join(sections).strip()
+
+
 def compose_response(reasoning: str, poem: PoemRecord) -> str:
-    """Combine cleaned editorial reasoning with the exact source poem.
+    """Append one canonical result marker and the exact source poem.
 
-    Any occurrence of the fully formatted poem is removed from the generated
-    reasoning. The cleanup also drops lines that exactly duplicate a source
-    couplet or hemistich, repeated final-result markers, and standalone headers
-    that would introduce a model-generated poem. Excess blank lines are
-    collapsed before one canonical Arabic final-result marker and the source
-    poem are appended verbatim. This guarantees that training targets end with
-    trusted source text rather than a potentially altered model reproduction.
-
-    Args:
-        reasoning: Model-generated editorial analysis, possibly containing
-            redundant poem text or result headings.
-        poem: Canonical source poem to append.
-
-    Returns:
-        The cleaned reasoning followed by ``النتيجة النهائية:`` and the
-        formatted source poem.
+    Verse and hemistich quotations inside the editorial work are preserved.
+    Only a leading or explicitly labeled full-poem dump and anything after an
+    accidental result marker are discarded before the trusted poem is appended.
     """
     marker = "النتيجة النهائية:"
-    reasoning = reasoning.replace(poem.poem_text, "")
-
-    source_lines = {
-        line.strip() for line in poem.poem_text.splitlines() if line.strip()
-    }
-    source_lines.update(verse.strip() for verse in poem.verses if verse.strip())
     standalone_poem_headers = {
         "القصيدة:",
         "القصيدة النهائية:",
         "النص النهائي:",
     }
-    retained_lines = []
-    for line in reasoning.splitlines():
-        stripped = line.strip()
-        if stripped == marker or stripped in source_lines:
-            continue
-        if stripped in standalone_poem_headers:
-            continue
-        retained_lines.append(line.rstrip())
+    editorial_reasoning = reasoning.split(marker, 1)[0]
+    for header in standalone_poem_headers:
+        editorial_reasoning = editorial_reasoning.replace(
+            f"{header}\n{poem.poem_text}", ""
+        )
+    if editorial_reasoning.lstrip().startswith(poem.poem_text):
+        leading_space = len(editorial_reasoning) - len(editorial_reasoning.lstrip())
+        editorial_reasoning = editorial_reasoning[
+            leading_space + len(poem.poem_text) :
+        ]
 
+    retained_lines = [
+        line.rstrip()
+        for line in editorial_reasoning.splitlines()
+        if line.strip() not in standalone_poem_headers
+    ]
     editorial_reasoning = "\n".join(retained_lines).strip()
     editorial_reasoning = re.sub(r"\n{3,}", "\n\n", editorial_reasoning)
-    return (
-        f"{editorial_reasoning}\n\n{marker}\n\n{poem.poem_text}"
-    )
+    return f"{editorial_reasoning}\n\n{marker}\n\n{poem.poem_text}"

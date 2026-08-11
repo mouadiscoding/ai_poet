@@ -3,9 +3,10 @@
 This project builds a supervised fine-tuning dataset from
 `data/ashaar_classic_moroccan.parquet`. For every unique poem it asks an
 OpenAI-compatible Gemma endpoint to reverse-construct a detailed Arabic writing
-instruction and an editorial reasoning section. The program then appends the
-original poem itself, rather than allowing the language model to reproduce or
-modify the training target.
+instruction. In a separate stage, it generates a structured editorial worklog
+for every couplet, including a rejected draft, revision reason, accepted line,
+prosodic or rhythmic review, and rhyme review. The program then renders those
+blocks and appends the original poem itself.
 
 The generator randomly chooses one of six concrete prompt templates for each
 poem. Every template and every few-shot example covers prosody or internal
@@ -84,14 +85,21 @@ context-size controls.
 
 Every completed request is appended immediately to
 `generation_checkpoint.jsonl`. Re-running the same command skips successful
-template-version-4 sample IDs and retries unresolved or legacy successes.
-Transient HTTP failures are retried
-up to three times with exponential backoff. Connection failures use the same
-backoff and stop the entire script if Gemma is still unreachable after the
-third retry. Responses that cannot be parsed receive format repair prompts.
-Every parseable instruction/reasoning pair is sent back to Gemma for field-level
-validation; Gemma rejections receive up to two repair prompts. There is no
-deterministic Python content validator.
+template-version-7 sample IDs and retries unresolved or legacy successes.
+Transient HTTP failures are retried up to three times with exponential
+backoff. Connection failures use the same backoff and stop the entire script if
+Gemma is still unreachable after the third retry. Responses that cannot be
+parsed receive phase-specific repair prompts. Python first validates the
+instruction layout and then requires exactly
+one structured work block per source couplet. Every accepted revision must
+match its source couplet exactly, while its first draft must differ, and
+generation metatext is rejected. Gemma then performs a separate semantic review
+of the instruction and the editorial content of each bounded reasoning chunk.
+Exact scansion remains outside that same-model semantic gate; the scansion
+fields are retained in the response but require purpose-built or expert review.
+Pre-draft imagery is required to use planning language, while the later
+revision decision must identify a real defect in the first draft and the
+concrete change that leads to the accepted verse.
 
 Each successful record is also appended and flushed immediately to
 `ashaar_sft.jsonl`, so the training data can be inspected while generation is
@@ -101,10 +109,11 @@ The run returns a non-zero exit status while any selected poem remains
 unresolved. `failures.jsonl` records those failures without storing request
 headers or credentials.
 
-Poems longer than 24,000 characters are analyzed in couplet-aligned chunks.
-Their final SFT record still includes the complete source poem and is marked
-with `oversized_for_sft=true`, allowing trainers to exclude it according to the
-target model's context length.
+Poems longer than 24,000 characters are analyzed in couplet-aligned chunks for
+the global instruction. Editorial reasoning is always generated in bounded
+three-couplet chunks, so long poems do not require one oversized completion. The
+final SFT record still includes the complete source poem and marks oversized
+source texts with `oversized_for_sft=true`.
 
 ## Outputs
 
@@ -137,10 +146,21 @@ The assistant message contains synthetic editorial reasoning followed by the
 source poem formatted as:
 
 ```text
+مرحلة التفكير والتحرير:
+
+<خطة القصيدة>
+
+البيت 1:
+<المعنى، المسودة، سبب المراجعة، الصياغة المنقحة، والفحص العروضي والقافية>
+
 النتيجة النهائية:
 
 صدر البيت = عجز البيت
 ```
+
+Because the pipeline starts from an existing poem, the worklog is a synthetic
+editorial reconstruction, not a claim about the historical poet's private
+thoughts.
 
 ## Tests
 

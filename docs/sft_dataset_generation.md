@@ -9,7 +9,7 @@ converts the poems in
 containing:
 
 1. A long Arabic instruction describing the poem to be written.
-2. A long Arabic editorial reasoning section.
+2. A rendered Arabic editorial worklog with one structured block per couplet.
 3. The exact source poem as the final answer.
 
 The generator uses the configured chat-completions endpoint and model to infer
@@ -130,50 +130,21 @@ an unresolved poem may choose another template. Every template is eligible for
 prose; its form guidance replaces meter and scansion with internal rhythm,
 parallelism, sound, and observable rhyme.
 
-### True multi-message few-shot prompting
+### Two separate few-shot stages
 
-Every final generation request uses this chat sequence:
-
-```text
-system:    generation policy and few-shot response conventions
-user:      demonstration source poem 1
-assistant: demonstration JSON 1
-user:      demonstration source poem 2
-assistant: demonstration JSON 2
-user:      the complete rendered template with source poem or analysis notes
-```
-
-This is few-shot prompting at the chat-message level, rather than embedding an
-unstructured example paragraph in one user message. The assistant
-demonstrations are valid JSON objects with the same fields expected from the
-real request:
+Instruction generation uses the existing six-message chat sequence: a system
+policy, two source/JSON demonstrations, and the selected concrete template. Its
+assistant demonstrations and actual result now contain only:
 
 ```json
-{
-  "instruction": "A detailed Arabic instruction",
-  "reasoning": "A detailed Arabic editorial analysis"
-}
+{"instruction": "A detailed Arabic instruction"}
 ```
 
-Metered templates use two compact metered examples, one on `الطويل` and one on
-`الخفيف`. Prose templates use two separate prose examples. Every example
-instruction and reasoning trace demonstrates sound/form, semantic progression,
-imagery/rhetoric, emotion/voice, occasion/addressee, and diction/revision. The
-examples teach:
-
-- The reverse-construction task.
-- Detailed thematic and rhetorical requirements.
-- Explicit numeric length requirements.
-- Appropriate prosodic language.
-- Drafting and revision discussion.
-- The exact JSON response contract.
-- The exact ordered instruction headings and seven-step composition plan.
-- Ending the reasoning with `النتيجة النهائية:` while omitting the consolidated
-  final poem.
-
-The examples are intentionally compact. Repeating a very large demonstration
-in all 50,193 calls would add substantial context cost and could distract Gemma
-from the actual poem.
+Editorial-work generation is a separate conversation after the instruction has
+passed validation. It uses a multi-verse metered demonstration or a multi-unit
+prose demonstration and requests structured, source-linked work for at most
+three target couplets. This separation prevents the model from narrating how it
+created the `instruction` when it should be acting as the poet.
 
 ### Actual instruction requirements
 
@@ -205,50 +176,33 @@ The instruction may mention isolated words useful for a rhyme or image, but it
 must not copy a complete source hemistich. It must not name the original poet,
 title, or URL.
 
-## Editorial reasoning and exact final targets
+## Editorial work and exact final targets
 
-Gemma generates a synthetic editorial rationale in Arabic. The prompt asks it
-to discuss:
+The second stage returns an `overview` for the first chunk and one
+`verse_reasoning` object per couplet. Every object contains the intended
+meaning, its link to the preceding context, imagery and diction, a genuine
+first draft, a specific reason for rejecting that draft, the exact accepted
+couplet, separate sound checks for both hemistichs, and a rhyme check.
 
-- The principal meanings.
-- The relation between the couplets.
-- Selected images and rhetorical techniques.
-- Initial wording alternatives.
-- Meter and rhyme observations for metered poems.
-- Reasons for changing or retaining expressions.
+This is an explicit synthetic editorial reconstruction. Because the pipeline
+starts from an existing poem, it is not represented as access to the historical
+poet's private thoughts.
 
-This is intended as an auditable, chain-of-thought-style editorial explanation;
-it should not be represented as access to a model's private hidden reasoning.
-
-Gemma is instructed to finish with:
-
-```text
-النتيجة النهائية:
-```
-
-Before composing the final response, the program removes any complete source
-poem, couplet, or standalone hemistich that Gemma may have echoed inside its
-reasoning. It also removes misplaced result markers and standalone final-poem
-headers. It then reconstructs the response in one invariant order: editorial
-reasoning, exactly one result marker, and the exact source poem at the end.
-Every pair of hemistichs is formatted as:
-
-```text
-صدر البيت = عجز البيت
-```
-
-This construction guarantees that the final poem is sourced from the input and
-is not rewritten, normalized, re-diacritized, or hallucinated by the endpoint.
+The renderer preserves accepted couplets quoted inside these work blocks. It
+removes only a leading or explicitly labeled accidental full-poem dump and
+anything after an accidental result marker, then appends exactly one canonical
+marker and the exact source poem. The endpoint therefore cannot rewrite, normalize,
+re-diacritize, or hallucinate the final target.
 
 ## Oversized-poem processing
 
 The direct source limit defaults to 24,000 characters. A longer poem is split
 at complete-couplet boundaries into chunks of at most 12,000 characters.
 
-For each chunk, the endpoint receives a separate compact-analysis request. It
-is asked to produce 300–600 Arabic characters covering only meanings, images,
-tone, and visible rhyme. The ordered summaries are then supplied to the normal
-few-shot generation conversation in place of the full source text.
+For each source-size chunk, the endpoint receives a compact-analysis request.
+The ordered summaries are used only by the global instruction stage. Editorial
+work is always generated separately in groups of at most three exact couplets,
+regardless of whether the source exceeded the direct-source limit.
 
 The result remains one instruction/answer pair for the complete poem, and the
 complete original poem is still appended to the response. Such rows receive:
@@ -290,31 +244,27 @@ The append-only trace assigns a new `run_id` to each invocation and records:
   the six concrete prompts, and the shared focus contract.
 - Per-poem provenance, all eligible template IDs, the fresh random selection,
   and why the selected template is retained through repairs.
-- Every request kind: oversized-poem chunk analysis, initial generation, and
-  repair, plus the separate Gemma validation request for each parseable pair.
+- Every request kind: oversized-poem analysis, instruction generation and
+  repair, verse-chunk generation and repair, and both quality-review phases.
 - The full OpenAI-compatible request body, including every system, few-shot,
   and final user message, seed, and decoding settings.
 - The complete decoded API response payload. This retains endpoint-provided
   fields such as `message.reasoning_content`, `finish_reason`, and `usage` when
   the server supplies them.
 - Network-attempt counts, retry errors, and elapsed time.
-- Raw generation content, parsed pairs, raw and parsed Gemma verdicts,
-  field-level validation errors, and whether a repair is required.
-- Parsed instruction, Gemma's editorial `reasoning` value, post-processing
-  counts, and the final assistant response after the exact source poem is
-  appended.
+- Raw generation content, parsed structures, deterministic contract errors,
+  raw and parsed Gemma verdicts, and whether a phase-specific repair is needed.
+- Parsed instruction, structured verse-work blocks, rendered editorial text,
+  and the final assistant response after the exact source poem is appended.
 - Final success, failure, template, and validation-status counts.
 
 The request body is the complete prompt representation available to this
 client. Any later conversion of those chat messages into Gemma's tokenized chat
 template happens inside the serving endpoint and cannot be observed here.
 
-The requested `reasoning` field is a synthetic editorial explanation emitted
-in Gemma's ordinary response content. It should not be described as private or
-otherwise inaccessible model reasoning. Gemma also does not generate the
-consolidated final poem: the program removes any poem echoes from the editorial
-reasoning and appends the trusted source poem. Consequently the trace labels
-the raw model content and final pipeline-composed response separately.
+The verse-work fields are ordinary structured response content, not private
+server reasoning. Gemma also does not generate the consolidated final poem;
+the program appends the trusted source poem after rendering the validated work.
 
 The request headers are never included. Before an event is printed or written,
 the configured API key is recursively replaced with `[REDACTED]` anywhere it
@@ -322,33 +272,33 @@ might appear in request, response, or error text.
 
 ## Response validation and repair
 
-The response parser reads the model response as JSON, tolerating a Markdown
-fence or wrapper text around one object. Python only requires extractable
-string `instruction` and `reasoning` values so the pair can be validated and
-stored. It performs no meter, length, language, keyword, copying, or poetic
-quality validation.
+Python performs deterministic validation before either semantic review. For
+instructions it checks the sole-field schema, minimum length, exact heading
+names and order, numeric count, meter name, and absence of complete source
+hemistichs. Missing-heading repair feedback names every required heading that
+was absent. For every
+reasoning chunk it checks the exact schema and block count, contiguous indices,
+non-empty fields, exact source equality of every `revised_draft`, a distinct
+`first_draft`, prospective rather than retrospective wording before that draft,
+and absence of dataset-generation metatext. The semantic review then checks
+that the stated defect really belongs to the first draft and that the proposed
+change leads coherently to the accepted verse.
 
-Every parseable pair is sent to the same Gemma model at temperature zero. The
-validation prompt includes the same poem or ordered long-poem summaries used
-for generation, the expected form and numeric count, the minimum lengths, and
-all six focus requirements. Gemma separately evaluates `instruction` and
-`reasoning` for schema, Arabic language, grounding, form, count, comprehensive
-focus coverage, editorial quality, final-result handling, and consistency.
-
-The validator must return exactly:
+Gemma then reviews the instruction or reasoning chunk at temperature zero for
+semantic and rhetorical quality. The instruction judge accepts the fixed seven
+heading contract and may not invent additional headings. The reasoning judge
+does not receive the two scansion fields, so exact scansion is not a same-model
+hard rejection gate; Python still requires those fields to be present and
+substantive. Each review returns exactly:
 
 ```json
-{
-  "instruction": {"passed": true, "errors": []},
-  "reasoning": {"passed": true, "errors": []}
-}
+{"passed": true, "errors": []}
 ```
 
-Both fields must pass. Gemma rejection reasons are added to the original
-conversation for a complete pair repair, with two corrected responses allowed
-by default. A malformed or inconsistent validation verdict fails the sample
-safely. Network retries are separate and apply to timeouts, HTTP 429, and HTTP
-5xx failures.
+Instruction failures repair only the instruction before verse generation
+begins. A failed reasoning chunk is repaired independently, so accepted chunks
+are not regenerated. Malformed verdicts fail safely. Network retries remain
+separate from content repairs.
 
 ## Checkpoint and resume semantics
 
@@ -366,7 +316,7 @@ or:
 ```
 
 On restart, a successful record is reused only when its `template_version` is
-4. Legacy successes without that version are regenerated and remain intact in
+7. Legacy successes without that version are regenerated and remain intact in
 the append-only log. Failed or missing IDs are also submitted again. A later
 success supersedes an earlier failure.
 
@@ -416,15 +366,18 @@ The pipeline writes the same logical records to `ashaar_sft.jsonl` and
 | `meter_name` | Decoded Arabic base-meter name |
 | `couplet_count` | Number of hemistich pairs |
 | `template_id` | Selected concrete prompt template |
-| `template_version` | Prompt and validation contract version; currently `4` |
+| `template_version` | Prompt and validation contract version; currently `7` |
 | `instruction` | Generated Arabic user instruction |
 | `response` | Generated reasoning plus exact source poem |
 | `messages` | Two-message chat SFT representation |
 | `sft_split` | Stable train, validation, or test assignment |
 | `oversized_for_sft` | Whether chunk analysis was required |
 | `metadata_conflict` | Whether duplicate sources disagreed on meter |
-| `generation_attempts` | Initial generation plus format or Gemma-requested repairs |
-| `validation_status` | Gemma validation `passed` or `passed_after_repair` |
+| `generation_attempts` | Total instruction and reasoning generation attempts |
+| `instruction_generation_attempts` | Instruction generation attempts including repairs |
+| `reasoning_generation_attempts` | Sum of generation attempts across reasoning chunks |
+| `reasoning_chunk_count` | Number of bounded verse-work chunks |
+| `validation_status` | Whether both phases passed directly or after any repair |
 
 `messages` contains:
 
@@ -535,9 +488,12 @@ Before a full production run is accepted, verify that:
 - The base-meter label does not prove a specific metrical form.
 - Semantic and rhetorical descriptions and their quality verdicts come from
   the same Gemma model, so correlated mistakes remain possible.
-- Gemma validation is not a substitute for expert Arabic scansion or manual
-  review, and it adds one model request for every parseable generation attempt.
-- Chunk summaries lose some local detail in extremely long poems.
+- The pipeline does not certify exact Arabic scansion. The generated scansion
+  fields still need expert or purpose-built prosody review, and semantic Gemma
+  validation adds a request for every parseable instruction or reasoning chunk
+  attempt.
+- Chunk summaries can lose global detail in instructions for extremely long
+  poems, although verse-work generation still receives each exact couplet.
 - Long reasoning increases storage and training-token cost substantially.
 - Keeping all oversized poems in the master data does not make them trainable
   by every target model.

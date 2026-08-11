@@ -5,8 +5,10 @@ from string import Formatter
 import unittest
 
 from ai_poet.synthetic_data.prompts.builder import (
+    build_instruction_validation_messages,
     build_messages,
-    build_validation_messages,
+    build_reasoning_messages,
+    build_reasoning_validation_messages,
 )
 from ai_poet.synthetic_data.meters import METER_NAMES
 from ai_poet.synthetic_data.prompts.templates import (
@@ -16,7 +18,11 @@ from ai_poet.synthetic_data.prompts.templates import (
     meter_explanation,
     plan_heading,
 )
-from tests.synthetic_data_helpers import make_poem, valid_value
+from tests.synthetic_data_helpers import (
+    make_poem,
+    valid_instruction_value,
+    valid_reasoning_value,
+)
 
 
 FOCUS_TERM_GROUPS = (
@@ -76,7 +82,7 @@ class TemplateTests(unittest.TestCase):
             self.assertEqual(fields, EXPECTED_TEMPLATE_FIELDS)
             self.assertIn("JSON", template.prompt)
             self.assertIn("instruction", template.prompt)
-            self.assertIn("reasoning", template.prompt)
+            self.assertNotIn("reasoning", template.prompt)
             positions = [
                 template.prompt.index(heading)
                 for heading in REQUIRED_INSTRUCTION_HEADINGS
@@ -118,7 +124,7 @@ class TemplateTests(unittest.TestCase):
             )
             for assistant in (messages[2], messages[4]):
                 example = json.loads(assistant["content"])
-                self.assertEqual(set(example), {"instruction", "reasoning"})
+                self.assertEqual(set(example), {"instruction"})
                 self.assertTrue(example["instruction"].startswith("الموضوع العام:"))
                 positions = [
                     example["instruction"].index(heading)
@@ -128,12 +134,11 @@ class TemplateTests(unittest.TestCase):
                     example["instruction"].index("خطة عملية لصناعة")
                 )
                 self.assertEqual(positions, sorted(positions))
-                for field in ("instruction", "reasoning"):
-                    for terms in FOCUS_TERM_GROUPS:
-                        self.assertTrue(
-                            any(term in example[field] for term in terms),
-                            f"{meter_name} {field} misses {terms}",
-                        )
+                for terms in FOCUS_TERM_GROUPS:
+                    self.assertTrue(
+                        any(term in example["instruction"] for term in terms),
+                        f"{meter_name} instruction misses {terms}",
+                    )
 
     def test_prose_can_use_every_template_and_adapts_prosody(self) -> None:
         for template in PROMPT_TEMPLATES:
@@ -150,11 +155,41 @@ class TemplateTests(unittest.TestCase):
                 "خطة عملية لصناعة نص شعري منثور:", messages[-1]["content"]
             )
 
-    def test_validation_prompt_contains_pair_reference_and_all_criteria(self) -> None:
+    def test_reasoning_prompt_requires_one_structured_block_per_target(self) -> None:
         poem = make_poem()
-        candidate = valid_value(poem)
-        messages = build_validation_messages(
-            candidate=candidate,
+        instruction = valid_instruction_value(poem)["instruction"]
+        messages = build_reasoning_messages(
+            instruction=instruction,
+            meter_name=poem.meter_name,
+            total_couplet_count=poem.couplet_count,
+            start_index=1,
+            couplets=poem.poem_text.splitlines(),
+            previous_couplet=None,
+            next_couplet=None,
+            include_overview=True,
+        )
+        self.assertEqual(
+            [message["role"] for message in messages],
+            ["system", "user", "assistant", "user"],
+        )
+        prompt = messages[-1]["content"]
+        self.assertIn("verse_reasoning", prompt)
+        self.assertIn("first_draft", prompt)
+        self.assertIn("problem_with_first_draft", prompt)
+        self.assertIn("revised_draft", prompt)
+        self.assertIn("خطة سابقة للمسودة", prompt)
+        self.assertIn("لفظًا موجودًا فعلًا في first_draft", prompt)
+        self.assertIn("تضم 2 أبيات", prompt)
+        for couplet in poem.poem_text.splitlines():
+            self.assertIn(couplet, prompt)
+        example = json.loads(messages[2]["content"])
+        self.assertGreaterEqual(len(example["verse_reasoning"]), 2)
+
+    def test_validation_prompts_are_phase_specific(self) -> None:
+        poem = make_poem()
+        instruction = valid_instruction_value(poem)["instruction"]
+        messages = build_instruction_validation_messages(
+            instruction=instruction,
             meter_name=poem.meter_name,
             couplet_count=poem.couplet_count,
             poem=poem.poem_text,
@@ -162,10 +197,31 @@ class TemplateTests(unittest.TestCase):
         )
         self.assertEqual([message["role"] for message in messages], ["system", "user"])
         self.assertIn(poem.poem_text, messages[1]["content"])
-        self.assertIn(candidate["instruction"], messages[1]["content"])
+        self.assertIn(instruction, messages[1]["content"])
         self.assertIn(ALL_FOCUS_REQUIREMENTS, messages[1]["content"])
-        self.assertIn(meter_explanation(poem.meter_name), messages[1]["content"])
-        for heading in REQUIRED_INSTRUCTION_HEADINGS:
-            self.assertIn(heading, messages[1]["content"])
-        self.assertIn("instruction", messages[0]["content"])
-        self.assertIn("reasoning", messages[0]["content"])
+        self.assertIn("لا تطلب عناوين إضافية", messages[1]["content"])
+        self.assertNotIn("مسودة وعيب", messages[0]["content"])
+
+        candidate = valid_reasoning_value(poem)
+        reasoning_messages = build_reasoning_validation_messages(
+            instruction=instruction,
+            meter_name=poem.meter_name,
+            expected_couplets=poem.poem_text.splitlines(),
+            candidate=candidate,
+        )
+        self.assertIn("مسودة شعرية حقيقية", reasoning_messages[1]["content"])
+        self.assertIn("تسلسلًا زمنيًا صادقًا", reasoning_messages[1]["content"])
+        self.assertIn("لا تدقق صحة التقطيع", reasoning_messages[1]["content"])
+        self.assertIn(poem.poem_text, reasoning_messages[1]["content"])
+        self.assertNotIn(
+            candidate["verse_reasoning"][0]["first_hemistich_scansion"],
+            reasoning_messages[1]["content"],
+        )
+        self.assertNotIn(
+            candidate["verse_reasoning"][0]["second_hemistich_scansion"],
+            reasoning_messages[1]["content"],
+        )
+        self.assertIn(
+            candidate["verse_reasoning"][0]["intended_meaning"],
+            reasoning_messages[1]["content"],
+        )

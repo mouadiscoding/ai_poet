@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from ai_poet.synthetic_data.config import GenerationSettings
@@ -41,29 +42,78 @@ def make_poem(
     )
 
 
-def valid_value(poem: PoemRecord, minimum: int = 80) -> dict[str, str]:
-    instruction_seed = (
-        f"أنت شاعر عربي فصيح. اكتب {poem.couplet_count} من الأبيات على بحر "
-        f"{poem.meter_name}. فصّل الموضوع والمعاني والصور والبلاغة والقافية "
-        "والجو العاطفي، وراع سلامة اللغة والنطق العروضي عند بناء النص. "
+def valid_instruction_value(
+    poem: PoemRecord, minimum: int = 80
+) -> dict[str, str]:
+    instruction = (
+        f"الموضوع العام:\nأنت شاعر عربي فصيح. اكتب {poem.couplet_count} من "
+        f"الأبيات على بحر {poem.meter_name} في معنى الصبر والرجاء، ورتب المعاني "
+        "من الشدة إلى الانفراج.\n\n"
+        "الجو العاطفي المطلوب:\nصوت متكلم هادئ ونبرة واثقة تخاطب سامعًا عامًا.\n\n"
+        "ألفاظ وصور يُستحسن استعمالها أو الدوران حولها:\nالقلب والليل والضياء "
+        "والرجاء، مع مقابلة العتمة بالنور وتجريب بدائل معجمية.\n\n"
+        "القافية:\nوحّد الروي بما يلائم الجرس الهادئ والمعنى المتدرج.\n\n"
+        f"شرح البحر المطلوب:\nبحر {poem.meter_name} بحر عربي موزون.\n"
+        "وزنه في كل بيت كامل:\nتفعيلات البحر الأصلية في الصدر والعجز.\n\n"
+        "الصورة الصوتية التقريبية:\nراجع المقاطع الطويلة والقصيرة وزن المنطوق، "
+        "وفك الشدة واقبل الزحافات الصحيحة.\n\n"
+        f"خطة عملية لصناعة بيت على بحر {poem.meter_name}:\nحدد المعنى والصورة، "
+        "ثم اكتب مسودة وانطقها وقطّعها وعدّل اللفظ وافحص كل شطر. "
     )
-    reasoning_seed = (
-        "مرحلة التفكير والتحرير: أحدد المعنى ثم أختار صورة بلاغية واستعارة مناسبة. "
-        "أجرب صياغة أولى، ثم أجري تعديلًا وتحريرًا بعد فحص الوزن والإيقاع والقافية. "
-        "أحافظ على وحدة المعاني وأشرح سبب كل محاولة وتعديل. النتيجة النهائية:"
-    )
-    repetitions = max(2, minimum // min(len(instruction_seed), len(reasoning_seed)) + 2)
-    return {
-        "instruction": instruction_seed * repetitions,
-        "reasoning": reasoning_seed * repetitions,
-    }
+    if len(instruction) < minimum:
+        instruction += "راجع وحدة المعنى والصورة والقافية. " * (
+            minimum // 35 + 1
+        )
+    return {"instruction": instruction}
 
 
-def valid_verdict() -> dict[str, dict[str, object]]:
-    return {
-        "instruction": {"passed": True, "errors": []},
-        "reasoning": {"passed": True, "errors": []},
-    }
+def valid_reasoning_value(
+    poem: PoemRecord,
+    *,
+    start_offset: int = 0,
+    chunk_size: int | None = None,
+) -> dict[str, object]:
+    couplets = poem.poem_text.splitlines()
+    selected = couplets[
+        start_offset : None if chunk_size is None else start_offset + chunk_size
+    ]
+    blocks = []
+    for offset, couplet in enumerate(selected, start=start_offset + 1):
+        blocks.append(
+            {
+                "verse_index": offset,
+                "intended_meaning": "أحدد لهذا البيت معنى متدرجًا يخدم انتقال القصيدة نحو الرجاء.",
+                "connection_to_previous": "أصله بما قبله، أو أجعله مطلعًا ممهدًا إن كان أول بيت.",
+                "imagery_and_diction": "أختار صورة الضوء وأوازن بين اللفظ المباشر والصورة البلاغية.",
+                "first_draft": f"مسودة مختلفة لصدر البيت {offset} = ومسودة مختلفة لعجزه",
+                "problem_with_first_draft": "عبارة مسودة مختلفة تقريرية وفي إيقاعها ثقل؛ لذلك أستبدلها بصورة الضوء وأخفف ترتيب العجز.",
+                "revised_draft": couplet,
+                "first_hemistich_scansion": "أنطق الصدر موصولًا وأقسمه إلى تفعيلات البحر مع فك الشدة.",
+                "second_hemistich_scansion": "أنطق العجز وأراجع حدوده الصوتية وموضع الضرب في آخره.",
+                "rhyme_check": "أفحص حرف الروي وحركته وأربط جرْسه بخاتمة المعنى.",
+            }
+        )
+    value: dict[str, object] = {"verse_reasoning": blocks}
+    if start_offset == 0:
+        value["overview"] = (
+            "أبني الأبيات في مسار واحد يبدأ بالصبر وينتهي بالضياء، وأجعل كل بيت "
+            "يمهد للذي يليه في المعنى والصورة."
+        )
+    return value
+
+
+def valid_verdict() -> dict[str, object]:
+    return {"passed": True, "errors": []}
+
+
+def valid_pipeline_outputs(poem: PoemRecord) -> list[str]:
+    """Return queued outputs for one successful single-chunk generation."""
+    return [
+        json.dumps(valid_instruction_value(poem), ensure_ascii=False),
+        json.dumps(valid_verdict(), ensure_ascii=False),
+        json.dumps(valid_reasoning_value(poem), ensure_ascii=False),
+        json.dumps(valid_verdict(), ensure_ascii=False),
+    ]
 
 
 class QueueClient:
