@@ -1,75 +1,108 @@
-"""Append and replay durable per-sample generation checkpoints."""
+"""Append and replay durable sample and accepted-stage checkpoints."""
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 import json
 from pathlib import Path
+import threading
 from typing import Any
 
 
-def load_checkpoint(path: Path) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
-    """Replay an append-only generation checkpoint into current sample state.
+CHECKPOINT_VERSION = 2
 
-    Each non-blank JSONL event is processed in file order, so later events for
-    a sample replace earlier ones. A success stores its record and clears any
-    prior failure for that sample. A failure stores its message but deliberately
-    does not remove an already recorded success; callers ultimately give the
-    success mapping precedence when determining completed work.
 
-    Args:
-        path: Checkpoint JSONL path. A missing file is treated as an empty
-            checkpoint.
+@dataclass
+class CheckpointState:
+    successes: dict[str, dict[str, Any]] = field(default_factory=dict)
+    success_fingerprints: dict[str, str] = field(default_factory=dict)
+    failures: dict[str, str] = field(default_factory=dict)
+    instructions: dict[str, dict[str, Any]] = field(default_factory=dict)
+    reasoning_chunks: dict[str, dict[int, dict[str, Any]]] = field(
+        default_factory=dict
+    )
 
-    Returns:
-        A pair ``(successes, failures)`` keyed by sample ID. Successful values
-        are full SFT records; failure values are error strings.
 
-    Raises:
-        ValueError: If any non-blank line contains malformed JSON.
-        KeyError: If a decoded event lacks required ``sample_id``, ``status``,
-            or successful ``record`` fields.
-        OSError: If an existing checkpoint cannot be read.
-    """
-    successes: dict[str, dict[str, Any]] = {}
-    failures: dict[str, str] = {}
+def load_checkpoint_state(path: Path) -> CheckpointState:
+    """Replay legacy and version-two checkpoint events in append order."""
+    state = CheckpointState()
     if not path.exists():
-        return successes, failures
+        return state
     with path.open("r", encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, start=1):
             if not line.strip():
                 continue
             try:
-                event = json.loads(line)
+                record = json.loads(line)
             except json.JSONDecodeError as exc:
                 raise ValueError(
                     f"Invalid checkpoint JSON on line {line_number}"
                 ) from exc
-            sample_id = event["sample_id"]
-            if event["status"] == "success":
-                successes[sample_id] = event["record"]
-                failures.pop(sample_id, None)
-            else:
-                failures[sample_id] = event.get("error", "unknown error")
-    return successes, failures
+            sample_id = record["sample_id"]
+            event = record.get("event")
+            if event is None:
+                if record.get("status") == "success":
+                    event = "sample_success"
+                else:
+                    event = "sample_failure"
+
+            if event == "sample_success":
+                state.successes[sample_id] = record["record"]
+                if record.get("generation_fingerprint"):
+                    state.success_fingerprints[sample_id] = str(
+                        record["generation_fingerprint"]
+                    )
+                else:
+                    state.success_fingerprints.pop(sample_id, None)
+                state.failures.pop(sample_id, None)
+            elif event == "sample_failure":
+                if sample_id not in state.successes:
+                    state.failures[sample_id] = record.get("error", "unknown error")
+            elif event == "instruction_success":
+                state.instructions[sample_id] = record
+                previous = state.reasoning_chunks.get(sample_id, {})
+                state.reasoning_chunks[sample_id] = {
+                    start: chunk
+                    for start, chunk in previous.items()
+                    if chunk.get("instruction_fingerprint")
+                    == record.get("instruction_fingerprint")
+                }
+            elif event == "reasoning_chunk_success":
+                start_offset = int(record["start_offset"])
+                state.reasoning_chunks.setdefault(sample_id, {})[start_offset] = record
+    return state
+
+
+def load_checkpoint(path: Path) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
+    """Return the legacy two-map checkpoint view used by existing callers."""
+    state = load_checkpoint_state(path)
+    return state.successes, state.failures
+
+
+def _serialize(event: dict[str, Any]) -> str:
+    return json.dumps(event, ensure_ascii=False) + "\n"
 
 
 def append_checkpoint(path: Path, event: dict[str, Any]) -> None:
-    """Append one durable JSON event to the generation checkpoint.
-
-    Parent directories are created as needed. The event is encoded as a single
-    UTF-8 JSON line with Arabic characters preserved, then the Python stream is
-    flushed so progress is visible to subsequent resume attempts even while a
-    larger corpus run is still active.
-
-    Args:
-        path: Destination JSONL checkpoint path.
-        event: JSON-serializable success or failure event.
-
-    Raises:
-        OSError: If directories or the checkpoint file cannot be written.
-        TypeError: If ``event`` contains values unsupported by ``json.dumps``.
-    """
+    """Append and flush one event; retained for backward compatibility."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8", newline="\n") as handle:
-        handle.write(json.dumps(event, ensure_ascii=False) + "\n")
+        handle.write(_serialize(event))
         handle.flush()
+
+
+class CheckpointWriter:
+    """Serialize checkpoint writes from concurrent sample and chunk workers."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._lock = threading.Lock()
+
+    def append(self, event: dict[str, Any]) -> None:
+        record = {"checkpoint_version": CHECKPOINT_VERSION, **event}
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self._lock, self.path.open(
+            "a", encoding="utf-8", newline="\n"
+        ) as handle:
+            handle.write(_serialize(record))
+            handle.flush()

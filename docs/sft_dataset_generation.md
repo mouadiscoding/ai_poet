@@ -216,12 +216,17 @@ mean every row fits the context length of a downstream training model.
 
 ### Authentication and TLS
 
-The endpoint, model, and API key are loaded from `.env` as `GEMMA_ENDPOINT`,
-`GEMMA_MODEL`, and `GEMMA_API_KEY`. All three values are required, and there are
-no endpoint or model defaults in the source code. Existing process-environment
-values take precedence over the file. The key is never written to checkpoints,
-output records, manifests, or logs. Errors are scrubbed if the key somehow
-appears in their text.
+Production pooling loads exactly three indexed records:
+`GEMMA_ENDPOINT_1..3`, `GEMMA_API_KEY_1..3`, and the corresponding served-model
+aliases in `GEMMA_MODEL_1..3`. If every deployment exposes the same model alias,
+one shared `GEMMA_MODEL` may replace the three indexed model variables; the two
+forms cannot be mixed. Optional administrative ceilings are configured through
+`GEMMA_MAX_CONCURRENCY_1..3`. Optional
+`GEMMA_METRICS_URL_1..3` values enable vLLM telemetry in capacity reports.
+Indexed and legacy variables may not be mixed. The legacy `GEMMA_ENDPOINT` and
+`GEMMA_API_KEY` pair remains supported for a single endpoint. Existing
+process-environment values take precedence over `.env`. Every configured key
+is scrubbed from checkpoints, output records, manifests, traces, and errors.
 
 TLS certificate verification is enabled by default. `--insecure` explicitly
 creates an unverified TLS context and is equivalent to `curl -k`. It should be
@@ -302,29 +307,28 @@ separate from content repairs.
 
 ## Checkpoint and resume semantics
 
-`generation_checkpoint.jsonl` is an append-only event log. Every completed
-future writes either:
+`generation_checkpoint.jsonl` is a versioned append-only event log. It records
+accepted stages immediately:
 
 ```json
-{"status": "success", "sample_id": "...", "record": {}}
+{"checkpoint_version": 2, "event": "instruction_success", "sample_id": "..."}
 ```
-
-or:
 
 ```json
-{"status": "failure", "sample_id": "...", "error": "..."}
+{"checkpoint_version": 2, "event": "reasoning_chunk_success", "sample_id": "...", "start_offset": 0}
 ```
 
-On restart, a successful record is reused only when its `template_version` is
-7. Legacy successes without that version are regenerated and remain intact in
-the append-only log. Failed or missing IDs are also submitted again. A later
-success supersedes an earlier failure.
+Final `sample_success` and `sample_failure` events complete the workflow. On
+restart, compatible accepted instructions and chunks are reused; missing stages
+alone are submitted again. Compatibility is enforced through the model,
+endpoint, prompt-template, and generation-settings fingerprint. Legacy
+success/failure events remain readable, and a successful record is reused only
+when its `template_version` is 7.
 
-Checkpoint events are written by the main thread after each concurrent task
-finishes, so individual JSON lines are not interleaved. Each successful SFT
-record is then appended and flushed to `ashaar_sft.jsonl`, making it visible
-while generation continues. During a run, newly generated records appear in
-completion order; when the run finishes, the file is rewritten in source order.
+All checkpoint appends pass through a locked writer and are flushed, so
+concurrent chunk completions cannot interleave JSON lines. Each successful SFT
+record is appended and flushed to `ashaar_sft.jsonl`; the finished file is
+rewritten in canonical source order.
 
 When `--limit` is used, checkpoint entries outside the selected prefix are
 ignored for that run. The command returns exit code 1 while any selected sample
@@ -378,6 +382,10 @@ The pipeline writes the same logical records to `ashaar_sft.jsonl` and
 | `reasoning_generation_attempts` | Sum of generation attempts across reasoning chunks |
 | `reasoning_chunk_count` | Number of bounded verse-work chunks |
 | `validation_status` | Whether both phases passed directly or after any repair |
+| `generation_endpoint_ids` | Endpoint IDs that served requests for this sample |
+| `endpoint_failover_count` | Cross-endpoint failovers used by successful logical requests |
+| `network_attempts` | Total HTTP attempts associated with the sample |
+| `truncated_completions` | Responses whose endpoint finish reason was `length` |
 
 `messages` contains:
 
@@ -392,6 +400,8 @@ The output directory also contains:
 
 - `generation_checkpoint.jsonl`
 - `generation_trace.jsonl` when `--trace` is enabled
+- `generation_metrics.jsonl` for lightweight 60-second pool telemetry
+- `pilot_report.json` and `pilot_review.json` for the strict production gate
 - `failures.jsonl`
 - `manifest.json`
 
@@ -409,37 +419,58 @@ enabled, its `run_id`, and the sidecar filename.
 
 ## Running the pipeline
 
-Create a local `.env` from the committed example, then set the endpoint, model,
-and a new API token in that file:
+Create a local `.env` from the committed example, then set the model and three
+endpoint records:
 
 ```powershell
 Copy-Item .env_example .env
 ```
 
 ```dotenv
-GEMMA_ENDPOINT=https://your-host.example/v1/chat/completions
-GEMMA_MODEL=your-model-name
-GEMMA_API_KEY=replace-with-a-new-token
+GEMMA_ENDPOINT_1=https://host-1.example/v1/chat/completions
+GEMMA_MODEL_1=your-endpoint-1-model-name
+GEMMA_API_KEY_1=replace-with-endpoint-1-token
+GEMMA_MAX_CONCURRENCY_1=32
+GEMMA_ENDPOINT_2=https://host-2.example/v1/chat/completions
+GEMMA_MODEL_2=your-endpoint-2-model-name
+GEMMA_API_KEY_2=replace-with-endpoint-2-token
+GEMMA_MAX_CONCURRENCY_2=32
+GEMMA_ENDPOINT_3=https://host-3.example/v1/chat/completions
+GEMMA_MODEL_3=your-endpoint-3-model-name
+GEMMA_API_KEY_3=replace-with-endpoint-3-token
+GEMMA_MAX_CONCURRENCY_3=32
 ```
 
-Run a ten-poem inspection sample first:
+Certify the endpoint capacities:
 
 ```powershell
-uv run ai-poet-generate-sft `
+uv run ai-poet-benchmark-endpoints `
   --input data/ashaar_classic_moroccan.parquet `
-  --output-dir data/ashaar_sft_smoke `
-  --limit 10 `
-  --trace `
+  --output-dir data/gemma_capacity `
   --insecure
 ```
 
-After manually reviewing the sample, run the corpus:
+Run the strict 300-poem pilot:
+
+```powershell
+uv run ai-poet-pilot-sft `
+  --input data/ashaar_classic_moroccan.parquet `
+  --output-dir data/ashaar_sft `
+  --capacity-report data/gemma_capacity/endpoint_capacity.json `
+  --insecure
+```
+
+After the automatic gate passes, inspect all records named by
+`pilot_review.json` and set their `approved` values to `true`. Then run the
+corpus:
 
 ```powershell
 uv run ai-poet-generate-sft `
   --input data/ashaar_classic_moroccan.parquet `
   --output-dir data/ashaar_sft `
-  --concurrency 4 `
+  --capacity-report data/gemma_capacity/endpoint_capacity.json `
+  --pilot-report data/ashaar_sft/pilot_report.json `
+  --pilot-review data/ashaar_sft/pilot_review.json `
   --insecure
 ```
 

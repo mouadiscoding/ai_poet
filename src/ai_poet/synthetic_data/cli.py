@@ -43,6 +43,34 @@ def build_parser() -> ArgumentParser:
     parser.add_argument("--chunk-chars", type=int, default=12000)
     parser.add_argument("--limit", type=int)
     parser.add_argument(
+        "--capacity-report",
+        type=Path,
+        help="Certified endpoint_capacity.json required for multi-endpoint runs",
+    )
+    parser.add_argument(
+        "--pilot-report",
+        type=Path,
+        help="Passing pilot_report.json required for multi-endpoint full runs",
+    )
+    parser.add_argument(
+        "--pilot-review",
+        type=Path,
+        help="Completed pilot_review.json required for multi-endpoint full runs",
+    )
+    parser.add_argument(
+        "--skip-pilot-review",
+        action="store_false",
+        dest="enforce_pilot_gate",
+        help="bypass both pilot artifacts (unsafe; emits a warning)",
+    )
+    parser.add_argument(
+        "--per-sample-chunk-cap",
+        type=int,
+        default=4,
+        help="Administrative maximum for concurrent chunks belonging to one poem",
+    )
+    parser.set_defaults(enforce_pilot_gate=True)
+    parser.add_argument(
         "--trace",
         action="store_true",
         help=(
@@ -68,7 +96,15 @@ def main() -> None:
         SystemExit: Always, with status zero, one, or two as described above.
     """
     try:
-        code = run(load_run_settings(build_parser().parse_args()))
+        args = build_parser().parse_args()
+        if not args.enforce_pilot_gate:
+            print(
+                "\033[33mWARNING: capacity certification, pilot report, and human "
+                "review checks are being skipped. Full generation will use the "
+                "configured endpoint concurrency limits.\033[0m",
+                file=sys.stderr,
+            )
+        code = run(load_run_settings(args))
     except (GemmaConnectionError, OSError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         raise SystemExit(2) from exc

@@ -28,67 +28,101 @@ sibling packages under `src/ai_poet` without coupling them to data generation.
 
 Never put an API key in the repository or command line. Revoke any key that has
 been pasted into chat, shell history, or logs, then create a local `.env` from
-the committed example and fill in all three required values:
+the committed example and fill in the model plus all three endpoint records:
 
 ```powershell
 Copy-Item .env_example .env
 ```
 
 ```dotenv
-GEMMA_ENDPOINT=https://your-host.example/v1/chat/completions
-GEMMA_MODEL=your-model-name
-GEMMA_API_KEY=replace-with-a-new-token
+GEMMA_ENDPOINT_1=https://host-1.example/v1/chat/completions
+GEMMA_MODEL_1=your-endpoint-1-model-name
+GEMMA_API_KEY_1=replace-with-endpoint-1-token
+GEMMA_MAX_CONCURRENCY_1=32
+GEMMA_ENDPOINT_2=https://host-2.example/v1/chat/completions
+GEMMA_MODEL_2=your-endpoint-2-model-name
+GEMMA_API_KEY_2=replace-with-endpoint-2-token
+GEMMA_MAX_CONCURRENCY_2=32
+GEMMA_ENDPOINT_3=https://host-3.example/v1/chat/completions
+GEMMA_MODEL_3=your-endpoint-3-model-name
+GEMMA_API_KEY_3=replace-with-endpoint-3-token
+GEMMA_MAX_CONCURRENCY_3=32
 ```
+
+The indexed configuration must contain exactly endpoints 1 through 3 and must
+not be mixed with the legacy variables. Use `GEMMA_MODEL_1..3` when deployments
+expose different served-model aliases. If all aliases are identical, one shared
+`GEMMA_MODEL` may replace them; the two model forms cannot be mixed. A
+single-endpoint run remains available through `GEMMA_ENDPOINT`,
+`GEMMA_API_KEY`, and `GEMMA_MODEL`.
 
 The client verifies TLS certificates by default. An internal endpoint may
 require `--insecure`, which is equivalent to `curl -k`; use that flag only for
 an endpoint you trust. Process-environment values override matching `.env`
 values.
 
-## Generate a smoke sample
+## Benchmark, pilot, and generate
 
-Start with a small run:
+First measure each endpoint in isolation and all three together. The command is
+resumable and writes a certified `endpoint_capacity.json` only when the
+throughput, error-rate, convergence, model, and combined-speedup gates pass:
 
 ```powershell
-uv run ai-poet-generate-sft `
+uv run ai-poet-benchmark-endpoints `
   --input data/ashaar_classic_moroccan.parquet `
-  --output-dir data/ashaar_sft_smoke `
-  --limit 10 `
-  --trace `
+  --output-dir data/gemma_capacity `
   --insecure
 ```
 
-`--trace` prints a full audit block for each generation step and appends the
-same structured events to `generation_trace.jsonl`. The trace shows the
-concrete-template catalog and rationale, the fresh random selection, every
-complete message array sent to Gemma, raw generation and Gemma-validation
-payloads, repair results, and the final response after the source poem is
-appended. Use it for smoke runs and audits; full-corpus traces are very large.
+The default benchmark warms each level for 30 seconds and measures it for five
+minutes. Use `--duration-per-level` and `--warmup-seconds` only for development;
+a shortened benchmark is not representative production evidence.
 
-Inspect the generated instructions and reasoning before starting the complete
+Run the deterministic 300-poem pilot into the final output directory. Accepted
+pilot records are written to the normal checkpoint and reused by the corpus
 run:
+
+```powershell
+uv run ai-poet-pilot-sft `
+  --input data/ashaar_classic_moroccan.parquet `
+  --output-dir data/ashaar_sft `
+  --capacity-report data/gemma_capacity/endpoint_capacity.json `
+  --insecure
+```
+
+The pilot must reach 98% final success, at most 25% repaired samples, and zero
+truncations. Inspect the 30 records listed in `pilot_review.json`, set every
+accepted entry's `approved` value to `true`, and add notes where useful. Then
+start the complete run:
 
 ```powershell
 uv run ai-poet-generate-sft `
   --input data/ashaar_classic_moroccan.parquet `
   --output-dir data/ashaar_sft `
-  --concurrency 4 `
+  --capacity-report data/gemma_capacity/endpoint_capacity.json `
+  --pilot-report data/ashaar_sft/pilot_report.json `
+  --pilot-review data/ashaar_sft/pilot_review.json `
   --insecure
 ```
 
-The endpoint and model are required in `.env`; neither has a default embedded
-in the code. Run
-`uv run ai-poet-generate-sft --help` for generation, validation, retry, and
-context-size controls.
+To deliberately run without either pilot artifact, pass
+`--skip-pilot-review`. This bypasses the capacity report, automated pilot
+report, and human review gate and prints a yellow warning. Without a capacity
+report, the run uses each endpoint's configured `GEMMA_MAX_CONCURRENCY_N`.
+
+Request concurrency comes from the capacity report. `--concurrency` remains a
+legacy single-endpoint option. Run any command with `--help` for its complete
+set of controls.
 
 ## Resume and failure handling
 
-Every completed request is appended immediately to
-`generation_checkpoint.jsonl`. Re-running the same command skips successful
-template-version-7 sample IDs and retries unresolved or legacy successes.
-Transient HTTP failures are retried up to three times with exponential
-backoff. Connection failures use the same backoff and stop the entire script if
-Gemma is still unreachable after the third retry. Responses that cannot be
+Accepted instructions and reasoning chunks are appended immediately to the
+versioned `generation_checkpoint.jsonl`, followed by the final sample event.
+Re-running skips compatible accepted stages as well as successful
+template-version-7 samples. Transient failures retry across healthy endpoints;
+429s, timeouts, latency pressure, and repeated server failures reduce only the
+affected endpoint's capacity. The run stops for a connection outage only when
+all endpoints exhaust the shared retry budget. Responses that cannot be
 parsed receive phase-specific repair prompts. Python first validates the
 instruction layout and then requires exactly
 one structured work block per source couplet. Every accepted revision must
@@ -110,10 +144,10 @@ unresolved. `failures.jsonl` records those failures without storing request
 headers or credentials.
 
 Poems longer than 24,000 characters are analyzed in couplet-aligned chunks for
-the global instruction. Editorial reasoning is always generated in bounded
-three-couplet chunks, so long poems do not require one oversized completion. The
-final SFT record still includes the complete source poem and marks oversized
-source texts with `oversized_for_sft=true`.
+the global instruction. Analysis and three-couplet reasoning chunks run in
+bounded parallelism, are assembled in source order, and are checkpointed
+independently. The final SFT record still includes the complete source poem and
+marks oversized source texts with `oversized_for_sft=true`.
 
 ## Outputs
 
@@ -124,10 +158,13 @@ The output directory contains:
 - `generation_checkpoint.jsonl`: append-only resume state.
 - `generation_trace.jsonl`: optional append-only prompt/response audit created
   by `--trace`.
+- `generation_metrics.jsonl`: lightweight 60-second endpoint-pool snapshots.
+- `pilot_report.json` and `pilot_review.json`: strict full-run gate artifacts.
 - `failures.jsonl`: currently unresolved samples.
 - `manifest.json`: generation settings and aggregate counts.
 
-Each training record includes the source hash and provenance, meter ID and
+Each training record includes the source hash and provenance, endpoint IDs,
+network-attempt and failover counts, meter ID and
 name, couplet count, concrete template ID and version, generated `instruction`,
 composed `response`, OpenAI-style `messages`, deterministic `sft_split`, and
 quality flags. Exact

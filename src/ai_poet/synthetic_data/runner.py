@@ -1,42 +1,43 @@
-"""Coordinate resumable, concurrent corpus generation runs."""
+"""Coordinate resumable, capacity-aware corpus generation runs."""
 
 from __future__ import annotations
 
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
+import math
 from pathlib import Path
+from typing import Any
 
-from .checkpoint import append_checkpoint, load_checkpoint
-from .client import GemmaClient
+from .capacity import (
+    CapacityPlan,
+    configured_capacity_plan,
+    load_capacity_report,
+    validate_pilot_gate,
+    workflow_fingerprint,
+)
+from .checkpoint import (
+    CheckpointWriter,
+    load_checkpoint,
+    load_checkpoint_state,
+)
+from .client import GemmaClient, GemmaPoolClient
 from .config import RunSettings
 from .corpus import load_poems
 from .errors import GemmaConnectionError
 from .generation import TEMPLATE_RATIONALE, generate_one
 from .outputs import append_jsonl, write_jsonl, write_outputs
+from .poems import PoemRecord, split_poem_chunks
 from .prompts.templates import (
     ALL_FOCUS_REQUIREMENTS,
     PROMPT_TEMPLATES,
     TEMPLATE_VERSION,
 )
+from .runtime_metrics import GenerationProgress, RuntimeMetricsWriter
 from .tracing import GenerationTracer, PRINT_LOCK
 
 
 def file_sha256(path: Path) -> str:
-    """Calculate the SHA-256 fingerprint of a file without loading it at once.
-
-    The file is streamed in one-megabyte binary blocks, so memory usage remains
-    bounded for large Parquet datasets.
-
-    Args:
-        path: File whose exact byte content should be hashed.
-
-    Returns:
-        The lowercase hexadecimal SHA-256 digest.
-
-    Raises:
-        OSError: If the file cannot be opened or read.
-    """
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         while block := handle.read(1024 * 1024):
@@ -44,49 +45,118 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def estimated_request_work(poem: PoemRecord, run_settings: RunSettings) -> int:
+    """Estimate logical calls so longest-processing-time scheduling is stable."""
+    reasoning_chunks = math.ceil(poem.couplet_count / 3)
+    oversized_chunks = (
+        len(split_poem_chunks(poem.verses, run_settings.generation.chunk_chars))
+        if len(poem.poem_text) > run_settings.generation.max_source_chars
+        else 0
+    )
+    return 2 + 2 * reasoning_chunks + oversized_chunks
+
+
+def _normalize_reused_record(record: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(record)
+    normalized.setdefault("generation_endpoint_ids", ["checkpoint_legacy"])
+    normalized.setdefault("endpoint_failover_count", 0)
+    normalized.setdefault("network_attempts", 0)
+    normalized.setdefault("truncated_completions", 0)
+    return normalized
+
+
+def _trace_run_start(
+    tracer: GenerationTracer | None,
+    run_settings: RunSettings,
+    source_fingerprint: str,
+    selected: int,
+    pending: int,
+    reused: int,
+    capacity: CapacityPlan | None,
+) -> None:
+    if tracer is None:
+        return
+    settings = run_settings.generation
+    tracer.emit(
+        {
+            "event": "run_start",
+            "source_path": str(run_settings.input),
+            "source_sha256": source_fingerprint,
+            "selected_poems": selected,
+            "checkpoint_reused": reused,
+            "pending_generation": pending,
+            "model": settings.model,
+            "endpoints": [
+                {
+                    "endpoint_id": endpoint.endpoint_id,
+                    "endpoint": endpoint.endpoint,
+                    "model": endpoint.model or settings.model,
+                    "hard_capacity": (
+                        capacity.hard_caps[endpoint.endpoint_id]
+                        if capacity is not None
+                        else run_settings.concurrency
+                    ),
+                }
+                for endpoint in settings.configured_endpoints
+            ],
+            "generation_settings": {
+                "temperature": settings.temperature,
+                "top_p": settings.top_p,
+                "max_tokens": settings.max_tokens,
+                "min_chars": settings.min_chars,
+                "max_source_chars": settings.max_source_chars,
+                "chunk_chars": settings.chunk_chars,
+                "timeout": settings.timeout,
+                "max_network_retries": settings.max_network_retries,
+                "max_repairs": settings.max_repairs,
+            },
+            "template_version": TEMPLATE_VERSION,
+            "template_rationale": TEMPLATE_RATIONALE,
+            "required_focuses": ALL_FOCUS_REQUIREMENTS,
+            "prompt_templates": [
+                {"template_id": template.template_id, "prompt": template.prompt}
+                for template in PROMPT_TEMPLATES
+            ],
+        }
+    )
+
 
 def run(run_settings: RunSettings) -> int:
-    """Execute a resumable, concurrent SFT dataset generation run.
-
-    Source poems are loaded and optionally limited, then prior checkpoint events
-    are replayed and restricted to the current selection. Poems without a saved
-    success are submitted to a thread pool. Each finished task is immediately
-    checkpointed as a success or sanitized failure, allowing later invocations
-    to resume without regenerating completed samples. Individual generation
-    exceptions do not abort the corpus, except an exhausted Gemma connection
-    failure, which cancels pending work and aborts the run. Successful records
-    are flushed to the SFT JSONL file as each task finishes; final ordered
-    JSONL, Parquet, failure, and manifest outputs are written after all pending
-    tasks finish.
-
-    Args:
-        run_settings: Validated source, output, concurrency, and generation
-            configuration.
-
-    Returns:
-        Zero when every selected poem has a successful record, otherwise one.
-
-    Raises:
-        GemmaConnectionError: If Gemma remains unreachable after every
-            configured connection retry.
-        ValueError: If configuration, the optional limit, or source poem data is
-            invalid.
-        OSError: If required input or output files cannot be accessed.
-    """
+    """Run generation with partial resume and optional three-endpoint pooling."""
     settings = run_settings.generation
     poems = load_poems(run_settings.input)
+    if run_settings.selected_sample_ids is not None:
+        available_ids = {poem.sample_id for poem in poems}
+        missing_ids = run_settings.selected_sample_ids - available_ids
+        if missing_ids:
+            raise ValueError(
+                f"Selected sample IDs are absent from the corpus: {len(missing_ids)}"
+            )
+        poems = [
+            poem for poem in poems if poem.sample_id in run_settings.selected_sample_ids
+        ]
     if run_settings.limit is not None:
         poems = poems[: run_settings.limit]
+    source_fingerprint = file_sha256(run_settings.input)
+    contract_fingerprint = workflow_fingerprint(settings, source_fingerprint)
 
     run_settings.output_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint = run_settings.output_dir / "generation_checkpoint.jsonl"
-    successes, previous_failures = load_checkpoint(checkpoint)
+    checkpoint_path = run_settings.output_dir / "generation_checkpoint.jsonl"
+    # Keep the legacy loader call so downstream integrations that patch or wrap it
+    # continue to observe the same public checkpoint entry point.
+    successes, previous_failures = load_checkpoint(checkpoint_path)
+    partial_state = load_checkpoint_state(checkpoint_path)
     selected_ids = {poem.sample_id for poem in poems}
     successes = {
-        sample_id: record
+        sample_id: _normalize_reused_record(record)
         for sample_id, record in successes.items()
         if sample_id in selected_ids
         and record.get("template_version") == TEMPLATE_VERSION
+        and (
+            sample_id not in partial_state.success_fingerprints
+            or partial_state.success_fingerprints[sample_id]
+            == contract_fingerprint
+        )
     }
     failures = {
         sample_id: error
@@ -94,6 +164,86 @@ def run(run_settings: RunSettings) -> int:
         if sample_id in selected_ids and sample_id not in successes
     }
     pending = [poem for poem in poems if poem.sample_id not in successes]
+    pending.sort(
+        key=lambda poem: (-estimated_request_work(poem, run_settings), poem.sample_id)
+    )
+
+    capacity: CapacityPlan | None = None
+    pilot_report_fingerprint: str | None = None
+    pilot_review_fingerprint: str | None = None
+    if settings.is_multi_endpoint:
+        if run_settings.capacity_report is not None:
+            capacity = load_capacity_report(
+                run_settings.capacity_report,
+                settings,
+                source_sha256=source_fingerprint,
+            )
+        elif not run_settings.enforce_pilot_gate:
+            capacity = configured_capacity_plan(settings)
+        else:
+            raise ValueError("Multi-endpoint generation requires a capacity report")
+        if run_settings.enforce_pilot_gate:
+            if run_settings.pilot_report is None or run_settings.pilot_review is None:
+                raise ValueError("Multi-endpoint generation requires pilot gate artifacts")
+            pilot_report_fingerprint, pilot_review_fingerprint = validate_pilot_gate(
+                run_settings.pilot_report,
+                run_settings.pilot_review,
+                settings=settings,
+                source_sha256=source_fingerprint,
+                capacity_fingerprint=capacity.report_fingerprint,
+            )
+
+    tracer = (
+        GenerationTracer(
+            run_settings.output_dir / "generation_trace.jsonl",
+            secrets=settings.secrets,
+        )
+        if run_settings.trace
+        else None
+    )
+    _trace_run_start(
+        tracer,
+        run_settings,
+        source_fingerprint,
+        len(poems),
+        len(pending),
+        len(poems) - len(pending),
+        capacity,
+    )
+
+    if capacity is None:
+        client: GemmaClient | GemmaPoolClient = GemmaClient(settings, tracer=tracer)
+        worker_count = run_settings.concurrency
+        chunk_executor: ThreadPoolExecutor | None = None
+        metrics_writer: RuntimeMetricsWriter | None = None
+        progress: GenerationProgress | None = None
+    else:
+        pool = GemmaPoolClient(settings, capacity, tracer=tracer)
+        client = pool
+        worker_count = capacity.total_capacity
+        chunk_executor = ThreadPoolExecutor(
+            max_workers=capacity.total_capacity,
+            thread_name_prefix="gemma-chunk",
+        )
+        progress = GenerationProgress(
+            pool,
+            total_samples=len(poems),
+            initial_completed=len(successes),
+            initial_repaired=sum(
+                record.get("validation_status") == "passed_after_repair"
+                for record in successes.values()
+            ),
+            initial_response_characters=sum(
+                len(str(record.get("response", "")))
+                for record in successes.values()
+            ),
+        )
+        metrics_writer = RuntimeMetricsWriter(
+            run_settings.output_dir / "generation_metrics.jsonl",
+            progress,
+        )
+        metrics_writer.start()
+
     sft_jsonl = run_settings.output_dir / "ashaar_sft.jsonl"
     write_jsonl(
         sft_jsonl,
@@ -103,108 +253,91 @@ def run(run_settings: RunSettings) -> int:
             if poem.sample_id in successes
         ),
     )
-    source_fingerprint = file_sha256(run_settings.input)
-    tracer = (
-        GenerationTracer(
-            run_settings.output_dir / "generation_trace.jsonl",
-            secrets=(settings.api_key,),
-        )
-        if run_settings.trace
-        else None
-    )
-    if tracer is not None:
-        tracer.emit(
-            {
-                "event": "run_start",
-                "source_path": str(run_settings.input),
-                "source_sha256": source_fingerprint,
-                "selected_poems": len(poems),
-                "checkpoint_reused": len(poems) - len(pending),
-                "pending_generation": len(pending),
-                "model": settings.model,
-                "endpoint": settings.endpoint,
-                "concurrency": run_settings.concurrency,
-                "generation_settings": {
-                    "temperature": settings.temperature,
-                    "top_p": settings.top_p,
-                    "max_tokens": settings.max_tokens,
-                    "min_chars": settings.min_chars,
-                    "max_source_chars": settings.max_source_chars,
-                    "chunk_chars": settings.chunk_chars,
-                    "timeout": settings.timeout,
-                    "max_network_retries": settings.max_network_retries,
-                    "max_repairs": settings.max_repairs,
-                },
-                "template_version": TEMPLATE_VERSION,
-                "template_rationale": TEMPLATE_RATIONALE,
-                "required_focuses": ALL_FOCUS_REQUIREMENTS,
-                "prompt_templates": [
-                    {
-                        "template_id": template.template_id,
-                        "prompt": template.prompt,
-                        "why_available": (
-                            "supports both metered and prose records and requires "
-                            "all six poetic dimensions"
-                        ),
-                    }
-                    for template in PROMPT_TEMPLATES
-                ],
-                "checkpoint_note": (
-                    "checkpoint_reused counts existing successful records; all "
-                    "per-sample events in this run are newly generated"
-                ),
-            }
-        )
-    client = GemmaClient(settings, tracer=tracer)
+    checkpoint_writer = CheckpointWriter(checkpoint_path)
     completed = len(poems) - len(pending)
-
-    with ThreadPoolExecutor(max_workers=run_settings.concurrency) as executor:
-        futures = {
-            executor.submit(generate_one, poem, client, settings): poem
-            for poem in pending
-        }
-        for future in as_completed(futures):
-            poem = futures[future]
-            completed += 1
-            try:
-                record = future.result()
-                successes[poem.sample_id] = record
-                failures.pop(poem.sample_id, None)
-                event = {
-                    "status": "success",
-                    "sample_id": poem.sample_id,
-                    "record": record,
-                }
-                status = "ok"
-            except GemmaConnectionError:
-                for pending_future in futures:
-                    pending_future.cancel()
-                raise
-            except Exception as exc:  # keep the corpus run resumable
-                error = str(exc).replace(settings.api_key, "[REDACTED]")
-                failures[poem.sample_id] = error
-                event = {
-                    "status": "failure",
-                    "sample_id": poem.sample_id,
-                    "error": error,
-                }
-                status = "failed"
-                if tracer is not None:
-                    tracer.emit(
-                        {
-                            "event": "sample_failure",
-                            "sample_id": poem.sample_id,
-                            "error_type": type(exc).__name__,
-                            "error": error,
-                            "origin": "generated_in_this_run",
-                        }
+    try:
+        with ThreadPoolExecutor(
+            max_workers=worker_count,
+            thread_name_prefix="gemma-sample",
+        ) as sample_executor:
+            futures = {}
+            for poem in pending:
+                per_sample_parallelism = run_settings.per_sample_chunk_cap
+                futures[
+                    sample_executor.submit(
+                        generate_one,
+                        poem,
+                        client,
+                        settings,
+                        generation_fingerprint=contract_fingerprint,
+                        resume_instruction=partial_state.instructions.get(poem.sample_id),
+                        resume_chunks=partial_state.reasoning_chunks.get(
+                            poem.sample_id, {}
+                        ),
+                        checkpoint_writer=checkpoint_writer,
+                        chunk_executor=chunk_executor,
+                        chunk_parallelism=per_sample_parallelism,
                     )
-            append_checkpoint(checkpoint, event)
-            if status == "ok":
-                append_jsonl(sft_jsonl, record)
-            with PRINT_LOCK:
-                print(f"[{completed}/{len(poems)}] {poem.sample_id[:12]} {status}")
+                ] = poem
 
+            for future in as_completed(futures):
+                poem = futures[future]
+                completed += 1
+                try:
+                    record = future.result()
+                    successes[poem.sample_id] = record
+                    failures.pop(poem.sample_id, None)
+                    event = {
+                        "event": "sample_success",
+                        "sample_id": poem.sample_id,
+                        "generation_fingerprint": contract_fingerprint,
+                        "record": record,
+                    }
+                    status = "ok"
+                    if progress is not None:
+                        progress.record_success(record)
+                except GemmaConnectionError:
+                    for pending_future in futures:
+                        pending_future.cancel()
+                    raise
+                except Exception as exc:  # keep the corpus run resumable
+                    error = str(exc)
+                    for secret in settings.secrets:
+                        error = error.replace(secret, "[REDACTED]")
+                    failures[poem.sample_id] = error
+                    event = {
+                        "event": "sample_failure",
+                        "sample_id": poem.sample_id,
+                        "generation_fingerprint": contract_fingerprint,
+                        "error": error,
+                    }
+                    status = "failed"
+                    if progress is not None:
+                        progress.record_failure()
+                    if tracer is not None:
+                        tracer.emit(
+                            {
+                                "event": "sample_failure",
+                                "sample_id": poem.sample_id,
+                                "error_type": type(exc).__name__,
+                                "error": error,
+                            }
+                        )
+                checkpoint_writer.append(event)
+                if status == "ok":
+                    append_jsonl(sft_jsonl, record)
+                with PRINT_LOCK:
+                    print(
+                        f"[{completed}/{len(poems)}] "
+                        f"{poem.sample_id[:12]} {status}"
+                    )
+    finally:
+        if chunk_executor is not None:
+            chunk_executor.shutdown(wait=True, cancel_futures=True)
+        if metrics_writer is not None:
+            metrics_writer.stop()
+
+    endpoint_metrics = client.snapshot() if isinstance(client, GemmaPoolClient) else None
     write_outputs(
         run_settings.output_dir,
         poems,
@@ -213,6 +346,14 @@ def run(run_settings: RunSettings) -> int:
         settings,
         source_fingerprint=source_fingerprint,
         trace_run_id=tracer.run_id if tracer is not None else None,
+        capacity_report_fingerprint=(
+            capacity.report_fingerprint
+            if capacity is not None and capacity.report_fingerprint
+            else None
+        ),
+        pilot_report_fingerprint=pilot_report_fingerprint,
+        pilot_review_fingerprint=pilot_review_fingerprint,
+        endpoint_metrics=endpoint_metrics,
     )
     unresolved = [poem for poem in poems if poem.sample_id not in successes]
     if tracer is not None:
@@ -220,7 +361,6 @@ def run(run_settings: RunSettings) -> int:
             {
                 "event": "run_summary",
                 "selected_poems": len(poems),
-                "checkpoint_reused": len(poems) - len(pending),
                 "generated_successes": sum(
                     poem.sample_id in successes for poem in pending
                 ),
@@ -234,6 +374,7 @@ def run(run_settings: RunSettings) -> int:
                         record["validation_status"] for record in successes.values()
                     )
                 ),
+                "endpoint_metrics": endpoint_metrics,
             }
         )
     return 1 if unresolved else 0

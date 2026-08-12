@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+from concurrent.futures import Executor, FIRST_COMPLETED, Future, wait
+import hashlib
 import json
 import random
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 from .assignment import sft_split
+from .checkpoint import CheckpointWriter
 from .client import GemmaClient
 from .config import GenerationSettings
 from .errors import GenerationError
@@ -43,10 +46,53 @@ def _emit_client_trace(client: Any, event: dict[str, Any]) -> None:
         tracer.emit(event)
 
 
-def _chunk_analysis(client: GemmaClient, poem: PoemRecord, max_chars: int) -> str:
+def _bounded_parallel_map(
+    executor: Executor | None,
+    jobs: Sequence[tuple[int, Callable[[], Any]]],
+    limit: int,
+) -> dict[int, Any]:
+    """Run jobs with a per-caller bound without flooding a shared executor."""
+    if executor is None or limit <= 1:
+        return {key: job() for key, job in jobs}
+    results: dict[int, Any] = {}
+    iterator = iter(jobs)
+    pending: dict[Future[Any], int] = {}
+
+    def submit_next() -> bool:
+        try:
+            key, job = next(iterator)
+        except StopIteration:
+            return False
+        pending[executor.submit(job)] = key
+        return True
+
+    for _ in range(min(limit, len(jobs))):
+        submit_next()
+    try:
+        while pending:
+            done, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for future in done:
+                key = pending.pop(future)
+                results[key] = future.result()
+                submit_next()
+    except Exception:
+        for future in pending:
+            future.cancel()
+        raise
+    return results
+
+
+def _chunk_analysis(
+    client: GemmaClient,
+    poem: PoemRecord,
+    max_chars: int,
+    *,
+    executor: Executor | None = None,
+    parallelism: int = 1,
+) -> str:
     """Summarize a long poem for the global instruction-generation stage."""
-    summaries: list[str] = []
     chunks = split_poem_chunks(poem.verses, max_chars)
+    jobs: list[tuple[int, Callable[[], str]]] = []
     for index, chunk in enumerate(chunks, start=1):
         messages = [
             {
@@ -64,8 +110,11 @@ def _chunk_analysis(client: GemmaClient, poem: PoemRecord, max_chars: int) -> st
                 ),
             },
         ]
-        summaries.append(
-            client.chat(
+        def analyze(
+            messages: list[dict[str, str]] = messages,
+            index: int = index,
+        ) -> str:
+            return client.chat(
                 messages,
                 max_tokens=800,
                 temperature=0.2,
@@ -77,10 +126,12 @@ def _chunk_analysis(client: GemmaClient, poem: PoemRecord, max_chars: int) -> st
                     "chunk_count": len(chunks),
                 },
             ).strip()
-        )
+
+        jobs.append((index, analyze))
+    summaries = _bounded_parallel_map(executor, jobs, parallelism)
     return "\n\n".join(
-        f"ملخص المقطع {index}: {summary}"
-        for index, summary in enumerate(summaries, start=1)
+        f"ملخص المقطع {index}: {summaries[index]}"
+        for index in range(1, len(chunks) + 1)
     )
 
 
@@ -349,13 +400,93 @@ def _generate_reasoning_chunk(
     )
 
 
+def _instruction_fingerprint(
+    generation_fingerprint: str,
+    template_id: str,
+    instruction: str,
+) -> str:
+    value = f"{generation_fingerprint}\x1f{template_id}\x1f{instruction}"
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _client_provenance(client: Any, sample_id: str) -> dict[str, Any]:
+    if hasattr(client, "sample_stats"):
+        return client.sample_stats(sample_id)
+    return {
+        "generation_endpoint_ids": ["legacy"],
+        "network_attempts": 0,
+        "endpoint_failover_count": 0,
+        "truncated_completions": 0,
+    }
+
+
+def _merge_provenance(
+    current: dict[str, Any],
+    prior_events: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    prior = [
+        event.get("provenance", {})
+        for event in prior_events
+        if isinstance(event.get("provenance"), dict)
+    ]
+    endpoints = set(current.get("generation_endpoint_ids", []))
+    for item in prior:
+        endpoints.update(item.get("generation_endpoint_ids", []))
+    return {
+        "generation_endpoint_ids": sorted(endpoints),
+        "network_attempts": int(current.get("network_attempts", 0))
+        + max((int(item.get("network_attempts", 0)) for item in prior), default=0),
+        "endpoint_failover_count": int(current.get("endpoint_failover_count", 0))
+        + max(
+            (int(item.get("endpoint_failover_count", 0)) for item in prior),
+            default=0,
+        ),
+        "truncated_completions": int(current.get("truncated_completions", 0))
+        + max(
+            (int(item.get("truncated_completions", 0)) for item in prior),
+            default=0,
+        ),
+    }
+
+
 def generate_one(
     poem: PoemRecord,
     client: GemmaClient,
     settings: GenerationSettings,
+    *,
+    generation_fingerprint: str = "legacy",
+    resume_instruction: dict[str, Any] | None = None,
+    resume_chunks: dict[int, dict[str, Any]] | None = None,
+    checkpoint_writer: CheckpointWriter | None = None,
+    chunk_executor: Executor | None = None,
+    chunk_parallelism: int = 1,
 ) -> dict[str, Any]:
-    """Generate one instruction and a validated editorial block per couplet."""
-    template = random.choice(PROMPT_TEMPLATES)
+    """Generate one SFT record while reusing compatible accepted stages."""
+    resume_chunks = resume_chunks or {}
+    effective_capacity = getattr(client, "total_effective_capacity", 1)
+    chunk_parallelism = min(
+        chunk_parallelism,
+        max(1, int(effective_capacity) // 4),
+    )
+    instruction_reused = bool(
+        resume_instruction
+        and resume_instruction.get("generation_fingerprint")
+        == generation_fingerprint
+        and isinstance(resume_instruction.get("instruction"), str)
+    )
+    if instruction_reused:
+        template_id = str(resume_instruction["template_id"])
+        try:
+            template = next(
+                item for item in PROMPT_TEMPLATES if item.template_id == template_id
+            )
+        except StopIteration as exc:
+            raise GenerationError(
+                f"checkpoint references unknown template {template_id}"
+            ) from exc
+    else:
+        template = random.choice(PROMPT_TEMPLATES)
+
     _emit_client_trace(
         client,
         {
@@ -369,57 +500,143 @@ def generate_one(
             "source_characters": len(poem.poem_text),
             "eligible_template_ids": [item.template_id for item in PROMPT_TEMPLATES],
             "selected_template_id": template.template_id,
+            "checkpoint_reused": instruction_reused,
             "why_used": {
                 "purpose": TEMPLATE_RATIONALE,
                 "eligibility": "all six templates support metered and prose poems",
-                "selection": "fresh uniform random choice, made once for this call",
+                "selection": (
+                    "retained from an accepted instruction checkpoint"
+                    if instruction_reused
+                    else "fresh uniform random choice, made once for this call"
+                ),
             },
         },
     )
 
     oversized = len(poem.poem_text) > settings.max_source_chars
-    notes = _chunk_analysis(client, poem, settings.chunk_chars) if oversized else None
-    source_material = (
-        "القصيدة طويلة؛ هذه ملخصات مرتبة لبناء التكليف العام من غير افتراض "
-        f"ما لم تذكره:\n{notes}"
-        if oversized
-        else poem.poem_text
-    )
     seed = int(poem.sample_id[:8], 16)
-    instruction, instruction_attempts = _generate_instruction(
-        poem=poem,
-        client=client,
-        settings=settings,
-        template=template,
-        source_material=source_material,
-        seed=seed,
-    )
-
-    all_couplets = poem.poem_text.splitlines()
-    overview: str | None = None
-    all_blocks: list[dict[str, Any]] = []
-    reasoning_attempts = 0
-    chunk_count = 0
-    for start_offset in range(0, len(all_couplets), REASONING_CHUNK_COUPLETS):
-        chunk_count += 1
-        chunk_couplets = all_couplets[
-            start_offset : start_offset + REASONING_CHUNK_COUPLETS
-        ]
-        chunk_overview, blocks, attempts = _generate_reasoning_chunk(
+    if instruction_reused:
+        instruction = str(resume_instruction["instruction"])
+        instruction_attempts = int(
+            resume_instruction.get("instruction_attempts", 1)
+        )
+    else:
+        notes = (
+            _chunk_analysis(
+                client,
+                poem,
+                settings.chunk_chars,
+                executor=chunk_executor,
+                parallelism=chunk_parallelism,
+            )
+            if oversized
+            else None
+        )
+        source_material = (
+            "القصيدة طويلة؛ هذه ملخصات مرتبة لبناء التكليف العام من غير افتراض "
+            f"ما لم تذكره:\n{notes}"
+            if oversized
+            else poem.poem_text
+        )
+        instruction, instruction_attempts = _generate_instruction(
             poem=poem,
             client=client,
             settings=settings,
-            instruction=instruction,
-            all_couplets=all_couplets,
-            start_offset=start_offset,
-            chunk_couplets=chunk_couplets,
+            template=template,
+            source_material=source_material,
             seed=seed,
         )
+
+    instruction_fingerprint = _instruction_fingerprint(
+        generation_fingerprint,
+        template.template_id,
+        instruction,
+    )
+    if checkpoint_writer is not None and not instruction_reused:
+        checkpoint_writer.append(
+            {
+                "event": "instruction_success",
+                "sample_id": poem.sample_id,
+                "generation_fingerprint": generation_fingerprint,
+                "instruction_fingerprint": instruction_fingerprint,
+                "template_id": template.template_id,
+                "instruction": instruction,
+                "instruction_attempts": instruction_attempts,
+                "provenance": _client_provenance(client, poem.sample_id),
+            }
+        )
+
+    all_couplets = poem.poem_text.splitlines()
+    starts = list(range(0, len(all_couplets), REASONING_CHUNK_COUPLETS))
+    chunk_results: dict[int, tuple[str | None, list[dict[str, Any]], int]] = {}
+    missing_jobs: list[
+        tuple[int, Callable[[], tuple[str | None, list[dict[str, Any]], int]]]
+    ] = []
+    for start_offset in starts:
+        resumed = resume_chunks.get(start_offset)
+        if (
+            resumed
+            and resumed.get("generation_fingerprint") == generation_fingerprint
+            and resumed.get("instruction_fingerprint") == instruction_fingerprint
+        ):
+            chunk_results[start_offset] = (
+                resumed.get("overview"),
+                list(resumed["blocks"]),
+                int(resumed.get("attempts", 1)),
+            )
+            continue
+        chunk_couplets = all_couplets[
+            start_offset : start_offset + REASONING_CHUNK_COUPLETS
+        ]
+
+        def generate_chunk(
+            start_offset: int = start_offset,
+            chunk_couplets: Sequence[str] = chunk_couplets,
+        ) -> tuple[str | None, list[dict[str, Any]], int]:
+            result = _generate_reasoning_chunk(
+                poem=poem,
+                client=client,
+                settings=settings,
+                instruction=instruction,
+                all_couplets=all_couplets,
+                start_offset=start_offset,
+                chunk_couplets=chunk_couplets,
+                seed=seed,
+            )
+            if checkpoint_writer is not None:
+                chunk_overview, blocks, attempts = result
+                checkpoint_writer.append(
+                    {
+                        "event": "reasoning_chunk_success",
+                        "sample_id": poem.sample_id,
+                        "generation_fingerprint": generation_fingerprint,
+                        "instruction_fingerprint": instruction_fingerprint,
+                        "start_offset": start_offset,
+                        "chunk_end": start_offset + len(chunk_couplets),
+                        "overview": chunk_overview,
+                        "blocks": blocks,
+                        "attempts": attempts,
+                        "provenance": _client_provenance(client, poem.sample_id),
+                    }
+                )
+            return result
+
+        missing_jobs.append((start_offset, generate_chunk))
+
+    chunk_results.update(
+        _bounded_parallel_map(chunk_executor, missing_jobs, chunk_parallelism)
+    )
+    overview: str | None = None
+    all_blocks: list[dict[str, Any]] = []
+    reasoning_attempts = 0
+    for start_offset in starts:
+        chunk_overview, blocks, attempts = chunk_results[start_offset]
         if chunk_overview is not None:
             overview = chunk_overview
         all_blocks.extend(blocks)
         reasoning_attempts += attempts
 
+    chunk_count = len(starts)
     if overview is None:
         raise GenerationError("first reasoning chunk did not produce an overview")
     if [block["verse_index"] for block in all_blocks] != list(
@@ -435,6 +652,16 @@ def generate_one(
     response = compose_response(editorial_reasoning, poem)
     generation_attempts = instruction_attempts + reasoning_attempts
     repaired = instruction_attempts > 1 or reasoning_attempts > chunk_count
+    current_provenance = _client_provenance(client, poem.sample_id)
+    if not hasattr(client, "sample_stats"):
+        current_provenance["network_attempts"] = generation_attempts * 2
+    provenance = _merge_provenance(
+        current_provenance,
+        [
+            *([resume_instruction] if resume_instruction else []),
+            *resume_chunks.values(),
+        ],
+    )
     record = {
         "sample_id": poem.sample_id,
         "source_row_indices": list(poem.source_row_indices),
@@ -460,6 +687,7 @@ def generate_one(
         "reasoning_generation_attempts": reasoning_attempts,
         "reasoning_chunk_count": chunk_count,
         "validation_status": "passed_after_repair" if repaired else "passed",
+        **provenance,
     }
     _emit_client_trace(
         client,
@@ -482,6 +710,9 @@ def generate_one(
             },
             "generation_attempts": generation_attempts,
             "validation_status": record["validation_status"],
+            "checkpoint_reused_instruction": instruction_reused,
+            "checkpoint_reused_chunks": len(starts) - len(missing_jobs),
+            **provenance,
         },
     )
     return record

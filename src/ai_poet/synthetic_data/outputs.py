@@ -50,6 +50,10 @@ def write_outputs(
     settings: GenerationSettings,
     source_fingerprint: str | None = None,
     trace_run_id: str | None = None,
+    capacity_report_fingerprint: str | None = None,
+    pilot_report_fingerprint: str | None = None,
+    pilot_review_fingerprint: str | None = None,
+    endpoint_metrics: dict[str, Any] | None = None,
 ) -> None:
     """Materialize generated records, failures, and a run manifest.
 
@@ -93,6 +97,14 @@ def write_outputs(
         "unresolved_failures": len(failure_records),
         "model": settings.model,
         "endpoint": settings.endpoint,
+        "endpoints": [
+            {
+                "endpoint_id": endpoint.endpoint_id,
+                "endpoint": endpoint.endpoint,
+                "model": endpoint.model or settings.model,
+            }
+            for endpoint in settings.configured_endpoints
+        ],
         "source_sha256": source_fingerprint,
         "template_version": TEMPLATE_VERSION,
         "generation": {
@@ -108,6 +120,17 @@ def write_outputs(
             "run_id": trace_run_id,
             "file": "generation_trace.jsonl" if trace_run_id is not None else None,
         },
+        "capacity_report_fingerprint": capacity_report_fingerprint,
+        "pilot_report_fingerprint": pilot_report_fingerprint,
+        "pilot_review_fingerprint": pilot_review_fingerprint,
+        "endpoint_metrics": endpoint_metrics,
+        "repaired_samples": sum(
+            record.get("validation_status") == "passed_after_repair"
+            for record in ordered
+        ),
+        "truncated_completions": sum(
+            int(record.get("truncated_completions", 0)) for record in ordered
+        ),
         "splits": dict(Counter(record["sft_split"] for record in ordered)),
         "templates": dict(Counter(record["template_id"] for record in ordered)),
         "oversized_for_sft": sum(

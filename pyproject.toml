@@ -17,6 +17,8 @@ dependencies = [
 
 [project.scripts]
 ai-poet-generate-sft = "ai_poet.synthetic_data.cli:main"
+ai-poet-benchmark-endpoints = "ai_poet.synthetic_data.benchmark_cli:main"
+ai-poet-pilot-sft = "ai_poet.synthetic_data.pilot_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
