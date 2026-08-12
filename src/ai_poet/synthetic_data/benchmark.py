@@ -55,6 +55,19 @@ class BenchmarkFixture:
     seed: int
 
 
+def _progress(message: str) -> None:
+    print(f"[benchmark] {message}", flush=True)
+
+
+def _result_summary(result: dict[str, Any]) -> str:
+    errors = result["retryable_errors"] + result["nonretryable_errors"]
+    return (
+        f"{result['successes']}/{result['requests']} successful, "
+        f"{errors} errors, {result['requests_per_second']:.2f} req/s, "
+        f"p95 {result['p95_latency_seconds']:.2f}s"
+    )
+
+
 def _stable_poem_choices(poems: Sequence[PoemRecord]) -> list[PoemRecord]:
     buckets: list[list[PoemRecord]] = [[], [], [], [], []]
     for poem in poems:
@@ -468,10 +481,16 @@ def run_benchmark(settings: BenchmarkSettings) -> int:
     checkpoint = settings.output_dir / "endpoint_benchmark.jsonl"
     completed = _load_completed(checkpoint, fingerprint)
     endpoint_reports: list[dict[str, Any]] = []
+    _progress(
+        f"loaded {len(fixtures)} fixtures for "
+        f"{len(settings.generation.configured_endpoints)} endpoints; "
+        f"checkpoint has {len(completed)} reusable results"
+    )
 
     preflight: dict[str, dict[str, Any]] = {}
     prompt_token_counts: list[int] = []
     for endpoint in settings.generation.configured_endpoints:
+        _progress(f"preflight {endpoint.endpoint_id}: contacting {endpoint.endpoint}")
         try:
             result = EndpointClient(endpoint, settings.generation).chat_once(
                 fixtures[0].messages,
@@ -495,6 +514,10 @@ def run_benchmark(settings: BenchmarkSettings) -> int:
             "prompt_tokens": prompt_tokens or None,
             "finish_reason": result.finish_reason,
         }
+        _progress(
+            f"preflight {endpoint.endpoint_id}: ready "
+            f"(model={response_model or 'unknown'}, prompt_tokens={prompt_tokens or 'unknown'})"
+        )
     tokenizer_usage_matches: bool | None = (
         len(set(prompt_token_counts)) == 1
         if len(prompt_token_counts) == len(settings.generation.configured_endpoints)
@@ -510,9 +533,18 @@ def run_benchmark(settings: BenchmarkSettings) -> int:
         if not levels or levels[-1] != endpoint.max_concurrency:
             levels = (*levels, endpoint.max_concurrency)
         results: list[dict[str, Any]] = []
+        _progress(
+            f"starting isolated tests for {endpoint.endpoint_id} at levels "
+            + ",".join(str(level) for level in dict.fromkeys(levels))
+        )
         for level in dict.fromkeys(levels):
             result = completed.get(("isolated", endpoint.endpoint_id, level))
             if result is None:
+                _progress(
+                    f"{endpoint.endpoint_id} concurrency {level}: warming for "
+                    f"{settings.warmup_seconds:g}s, then measuring for "
+                    f"{settings.duration_per_level:g}s"
+                )
                 result = run_workload(
                     endpoint,
                     settings.generation,
@@ -524,8 +556,18 @@ def run_benchmark(settings: BenchmarkSettings) -> int:
                 _append_result(
                     checkpoint, fingerprint, result, phase="isolated"
                 )
+                _progress(
+                    f"{endpoint.endpoint_id} concurrency {level}: "
+                    + _result_summary(result)
+                )
+            else:
+                _progress(
+                    f"{endpoint.endpoint_id} concurrency {level}: reused checkpoint "
+                    f"({_result_summary(result)})"
+                )
             results.append(result)
 
+        _progress(f"{endpoint.endpoint_id}: running oversized request probes")
         probe_results = [
             run_workload(
                 endpoint,
@@ -547,6 +589,11 @@ def run_benchmark(settings: BenchmarkSettings) -> int:
             and result["retryable_errors"] == 0
             and result["nonretryable_errors"] == 0
             for result in probe_results
+        )
+        _progress(
+            f"{endpoint.endpoint_id}: selected concurrency {selected}; "
+            f"probes {'passed' if probes_ok else 'failed'}; "
+            f"curve {'not converged' if nonconverged else 'converged'}"
         )
         endpoint_reports.append(
             {
@@ -599,6 +646,9 @@ def run_benchmark(settings: BenchmarkSettings) -> int:
         # Run all endpoints together even if one prior partial combined result exists;
         # only a complete simultaneous phase is considered certifying.
         combined_results = {}
+        _progress(
+            "starting simultaneous combined test for all configured endpoints"
+        )
         with ThreadPoolExecutor(max_workers=3) as executor:
             combined_futures = {
                 endpoint.endpoint_id: executor.submit(
@@ -622,6 +672,9 @@ def run_benchmark(settings: BenchmarkSettings) -> int:
                 _append_result(
                     checkpoint, fingerprint, result, phase="combined"
                 )
+                _progress(f"combined {endpoint_id}: {_result_summary(result)}")
+    else:
+        _progress("reused all combined-test results from checkpoint")
     predicted = sum(
         result["requests_per_second"] for result in isolated_selected.values()
     )
@@ -677,5 +730,9 @@ def run_benchmark(settings: BenchmarkSettings) -> int:
     (settings.output_dir / "endpoint_capacity.json").write_text(
         json.dumps(report, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
+    )
+    _progress(
+        f"finished: {'certified' if certified else 'not certified'}; report written to "
+        f"{settings.output_dir / 'endpoint_capacity.json'}"
     )
     return 0 if certified else 1

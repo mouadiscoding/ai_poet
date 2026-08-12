@@ -4,7 +4,11 @@ import hashlib
 import json
 import unittest
 
-from ai_poet.synthetic_data.benchmark import build_fixture_bank, select_capacity
+from ai_poet.synthetic_data.benchmark import (
+    _result_summary,
+    build_fixture_bank,
+    select_capacity,
+)
 from ai_poet.synthetic_data.capacity import (
     PILOT_REPORT_VERSION,
     REPORT_VERSION,
@@ -31,6 +35,23 @@ def endpoints() -> tuple[EndpointSettings, ...]:
 
 
 class BenchmarkAndPilotTests(unittest.TestCase):
+    def test_benchmark_result_summary_is_human_readable(self) -> None:
+        summary = _result_summary(
+            {
+                "requests": 100,
+                "successes": 98,
+                "retryable_errors": 1,
+                "nonretryable_errors": 1,
+                "requests_per_second": 3.456,
+                "p95_latency_seconds": 2.345,
+            }
+        )
+
+        self.assertEqual(
+            summary,
+            "98/100 successful, 2 errors, 3.46 req/s, p95 2.35s",
+        )
+
     def test_configured_capacity_plan_uses_endpoint_ceilings(self) -> None:
         generation = settings(endpoints=endpoints())
 
