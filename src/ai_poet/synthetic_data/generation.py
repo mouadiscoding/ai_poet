@@ -32,6 +32,7 @@ from .validation import (
 
 
 REASONING_CHUNK_COUPLETS = 3
+VALIDATOR_FORMAT_ATTEMPTS = 3
 
 TEMPLATE_RATIONALE = (
     "Six concrete prompts vary the order and framing of instruction "
@@ -155,6 +156,49 @@ def _repair_messages(
     ]
 
 
+def _request_verdict(
+    client: GemmaClient,
+    messages: Sequence[dict[str, str]],
+    *,
+    max_tokens: int,
+    seed: int,
+    trace_context: dict[str, Any],
+) -> tuple[str, dict[str, Any], int]:
+    """Retry malformed judge output without charging it to candidate repairs."""
+    last_error: Exception | None = None
+    raw = ""
+    for attempt in range(1, VALIDATOR_FORMAT_ATTEMPTS + 1):
+        retry_messages = list(messages)
+        if attempt > 1:
+            retry_messages.extend(
+                [
+                    {"role": "assistant", "content": raw},
+                    {
+                        "role": "user",
+                        "content": (
+                            "أعد كائن JSON واحدًا فقط بالمفتاحين passed وerrors، "
+                            "بلا شرح ولا كائن ثانٍ."
+                        ),
+                    },
+                ]
+            )
+        raw = client.chat(
+            retry_messages,
+            max_tokens=max_tokens,
+            temperature=0.0,
+            seed=seed + attempt - 1,
+            trace_context={
+                **trace_context,
+                "validator_format_attempt": attempt,
+            },
+        )
+        try:
+            return raw, parse_field_verdict(raw), attempt
+        except (ValueError, json.JSONDecodeError) as exc:
+            last_error = exc
+    raise GenerationError(f"validation response remained invalid: {last_error}")
+
+
 def _generate_instruction(
     *,
     poem: PoemRecord,
@@ -219,7 +263,8 @@ def _generate_instruction(
         if errors:
             continue
 
-        validation_raw = client.chat(
+        validation_raw, verdict, validator_attempts = _request_verdict(
+            client,
             build_instruction_validation_messages(
                 instruction=instruction,
                 meter_name=poem.meter_name,
@@ -228,7 +273,6 @@ def _generate_instruction(
                 minimum_chars=settings.min_chars,
             ),
             max_tokens=1200,
-            temperature=0.0,
             seed=seed + 100_000 + repair,
             trace_context={
                 "sample_id": poem.sample_id,
@@ -237,12 +281,6 @@ def _generate_instruction(
                 "template_id": template.template_id,
             },
         )
-        try:
-            verdict = parse_field_verdict(validation_raw)
-        except (ValueError, json.JSONDecodeError) as exc:
-            raise GenerationError(
-                f"Gemma instruction validation response was invalid: {exc}"
-            ) from exc
         errors = [
             f"Gemma rejected instruction: {error}" for error in verdict["errors"]
         ]
@@ -254,6 +292,7 @@ def _generate_instruction(
                 "generation_attempt": repair + 1,
                 "raw_validator_content": validation_raw,
                 "parsed_verdict": verdict,
+                "validator_format_attempts": validator_attempts,
                 "passed": not errors,
                 "validation_errors": errors,
             },
@@ -349,7 +388,8 @@ def _generate_reasoning_chunk(
         if errors:
             continue
 
-        validation_raw = client.chat(
+        validation_raw, verdict, validator_attempts = _request_verdict(
+            client,
             build_reasoning_validation_messages(
                 instruction=instruction,
                 meter_name=poem.meter_name,
@@ -357,7 +397,6 @@ def _generate_reasoning_chunk(
                 candidate=value,
             ),
             max_tokens=1200,
-            temperature=0.0,
             seed=seed + 200_000 + start_index * 100 + repair,
             trace_context={
                 "sample_id": poem.sample_id,
@@ -367,12 +406,6 @@ def _generate_reasoning_chunk(
                 "generation_attempt": repair + 1,
             },
         )
-        try:
-            verdict = parse_field_verdict(validation_raw)
-        except (ValueError, json.JSONDecodeError) as exc:
-            raise GenerationError(
-                f"Gemma reasoning validation response was invalid: {exc}"
-            ) from exc
         errors = [
             f"Gemma rejected reasoning: {error}" for error in verdict["errors"]
         ]
@@ -386,6 +419,7 @@ def _generate_reasoning_chunk(
                 "generation_attempt": repair + 1,
                 "raw_validator_content": validation_raw,
                 "parsed_verdict": verdict,
+                "validator_format_attempts": validator_attempts,
                 "passed": not errors,
                 "validation_errors": errors,
             },

@@ -10,6 +10,9 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 
+DEFAULT_MAX_COUPLETS = 24
+
+
 @dataclass(frozen=True)
 class EndpointSettings:
     """Connection and administrative limits for one serving endpoint."""
@@ -79,6 +82,7 @@ class RunSettings:
     per_sample_chunk_cap: int = 4
     enforce_pilot_gate: bool = True
     selected_sample_ids: frozenset[str] | None = None
+    max_couplets: int | None = DEFAULT_MAX_COUPLETS
 
 
 def _load_endpoints(global_model: str | None) -> tuple[EndpointSettings, ...]:
@@ -230,6 +234,9 @@ def load_run_settings(args: Namespace) -> RunSettings:
         raise ValueError("--concurrency must be at least 1")
     if args.limit is not None and args.limit < 1:
         raise ValueError("--limit must be at least 1")
+    max_couplets = getattr(args, "max_couplets", DEFAULT_MAX_COUPLETS)
+    if max_couplets < 1:
+        raise ValueError("--max-couplets must be at least 1")
     per_sample_chunk_cap = getattr(args, "per_sample_chunk_cap", 4)
     if per_sample_chunk_cap < 1:
         raise ValueError("--per-sample-chunk-cap must be at least 1")
@@ -256,4 +263,5 @@ def load_run_settings(args: Namespace) -> RunSettings:
         pilot_review=pilot_review,
         per_sample_chunk_cap=per_sample_chunk_cap,
         enforce_pilot_gate=enforce_pilot_gate,
+        max_couplets=max_couplets,
     )

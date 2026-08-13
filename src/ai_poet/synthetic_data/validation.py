@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 from typing import Any, Sequence
 
 
@@ -84,6 +85,24 @@ def _normalize_arabic_for_contract(value: str) -> str:
     return unmarked.translate(str.maketrans("أإآٱ", "اااا"))
 
 
+def normalize_couplet_copy(value: str) -> str:
+    """Normalize harmless Unicode and separator spacing for source-copy checks."""
+    normalized = unicodedata.normalize("NFC", value).strip()
+    left, separator, right = normalized.partition("=")
+    if not separator or "=" in right:
+        return normalized
+    return f"{left.strip()} = {right.strip()}"
+
+
+def _grounding_words(value: str) -> set[str]:
+    normalized = _normalize_arabic_for_contract(value).casefold()
+    return {
+        word
+        for word in re.findall(r"[\w\u0600-\u06ff]+", normalized)
+        if len(word) >= 3
+    }
+
+
 def extract_json_object(raw: str) -> dict[str, Any]:
     """Extract a top-level JSON object from an untrusted model response."""
     cleaned = CODE_FENCE_RE.sub("", raw.strip()).strip()
@@ -91,10 +110,9 @@ def extract_json_object(raw: str) -> dict[str, Any]:
         value = json.loads(cleaned)
     except json.JSONDecodeError:
         start = cleaned.find("{")
-        end = cleaned.rfind("}")
-        if start < 0 or end <= start:
+        if start < 0:
             raise ValueError("response does not contain a JSON object")
-        value = json.loads(cleaned[start : end + 1])
+        value, _ = json.JSONDecoder().raw_decode(cleaned[start:])
     if not isinstance(value, dict):
         raise ValueError("response JSON must be an object")
     return value
@@ -212,11 +230,14 @@ def extract_reasoning_chunk(
                 )
             cleaned[field] = field_value.strip()
 
-        if cleaned["revised_draft"] != expected_couplet:
+        if normalize_couplet_copy(cleaned["revised_draft"]) != normalize_couplet_copy(
+            expected_couplet
+        ):
             raise ValueError(
                 f"reasoning block {expected_index} revised_draft must exactly match "
                 "its source couplet"
             )
+        cleaned["revised_draft"] = expected_couplet
         if cleaned["first_draft"] == cleaned["revised_draft"]:
             raise ValueError(
                 f"reasoning block {expected_index} first_draft must differ from revised_draft"
@@ -225,6 +246,19 @@ def extract_reasoning_chunk(
             raise ValueError(
                 f"reasoning block {expected_index} first_draft must contain two "
                 "hemistichs separated by exactly one ="
+            )
+        first_draft_words = _grounding_words(cleaned["first_draft"])
+        revised_draft_words = _grounding_words(cleaned["revised_draft"])
+        decision_words = _grounding_words(cleaned["problem_with_first_draft"])
+        if not first_draft_words & decision_words:
+            raise ValueError(
+                f"reasoning block {expected_index} revision decision must cite "
+                "wording from first_draft"
+            )
+        if not revised_draft_words & decision_words:
+            raise ValueError(
+                f"reasoning block {expected_index} revision decision must cite "
+                "wording from revised_draft"
             )
         short_fields = [
             field

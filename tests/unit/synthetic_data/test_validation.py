@@ -24,6 +24,10 @@ class ValidationTests(unittest.TestCase):
         raw = json.dumps(value, ensure_ascii=False)
         self.assertEqual(extract_json_object(raw), value)
         self.assertEqual(extract_json_object(f"```json\n{raw}\n```"), value)
+        self.assertEqual(
+            extract_json_object(raw + "\n" + json.dumps({"extra": True})),
+            value,
+        )
 
     def test_instruction_extraction_requires_one_string_field(self) -> None:
         self.assertEqual(
@@ -111,6 +115,20 @@ class ValidationTests(unittest.TestCase):
                 expected_couplets=poem.poem_text.splitlines(),
                 include_overview=True,
             )
+
+    def test_reasoning_chunk_canonicalizes_harmless_source_copy_spacing(self) -> None:
+        poem = make_poem()
+        value = valid_reasoning_value(poem)
+        value["verse_reasoning"][0]["revised_draft"] = value[
+            "verse_reasoning"
+        ][0]["revised_draft"].replace(" = ", "=")
+        _, blocks = extract_reasoning_chunk(
+            value,
+            expected_indices=[1, 2],
+            expected_couplets=poem.poem_text.splitlines(),
+            include_overview=True,
+        )
+        self.assertEqual(blocks[0]["revised_draft"], poem.poem_text.splitlines()[0])
 
     def test_reasoning_chunk_rejects_generation_metatext(self) -> None:
         poem = make_poem()

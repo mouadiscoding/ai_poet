@@ -6,7 +6,11 @@ import unittest
 from unittest.mock import patch
 
 from ai_poet.synthetic_data.cli import build_parser, main
-from ai_poet.synthetic_data.config import load_generation_settings, load_run_settings
+from ai_poet.synthetic_data.config import (
+    DEFAULT_MAX_COUPLETS,
+    load_generation_settings,
+    load_run_settings,
+)
 
 class ConfigurationTests(unittest.TestCase):
     def test_settings_load_required_values_from_dotenv(self) -> None:
@@ -142,13 +146,27 @@ class ConfigurationTests(unittest.TestCase):
         self.assertNotIn("--endpoint", help_text)
         self.assertNotIn("--model", help_text)
 
-    def test_run_settings_reject_invalid_concurrency_and_limit(self) -> None:
-        invalid_arguments = (("--concurrency", "0"), ("--limit", "0"))
+    def test_run_settings_reject_invalid_numeric_bounds(self) -> None:
+        invalid_arguments = (
+            ("--concurrency", "0"),
+            ("--limit", "0"),
+            ("--max-couplets", "0"),
+        )
         for option, value in invalid_arguments:
             with self.subTest(option=option):
                 args = build_parser().parse_args([option, value])
                 with self.assertRaises(ValueError):
                     load_run_settings(args)
+
+    def test_max_couplets_has_bounded_default_and_override(self) -> None:
+        self.assertEqual(
+            build_parser().parse_args([]).max_couplets,
+            DEFAULT_MAX_COUPLETS,
+        )
+        self.assertEqual(
+            build_parser().parse_args(["--max-couplets", "12"]).max_couplets,
+            12,
+        )
 
     def test_skip_pilot_review_allows_missing_gate_artifacts(self) -> None:
         args = build_parser().parse_args(["--skip-pilot-review"])

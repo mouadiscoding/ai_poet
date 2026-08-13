@@ -6,7 +6,7 @@ from argparse import ArgumentParser
 from pathlib import Path
 import sys
 
-from .config import load_run_settings
+from .config import DEFAULT_MAX_COUPLETS, load_run_settings
 from .errors import GemmaConnectionError
 from .runner import run
 
@@ -41,6 +41,15 @@ def build_parser() -> ArgumentParser:
     parser.add_argument("--min-chars", type=int, default=1500)
     parser.add_argument("--max-source-chars", type=int, default=24000)
     parser.add_argument("--chunk-chars", type=int, default=12000)
+    parser.add_argument(
+        "--max-couplets",
+        type=int,
+        default=DEFAULT_MAX_COUPLETS,
+        help=(
+            "exclude poems longer than this many couplets before --limit is "
+            f"applied (default: {DEFAULT_MAX_COUPLETS})"
+        ),
+    )
     parser.add_argument("--limit", type=int)
     parser.add_argument(
         "--capacity-report",

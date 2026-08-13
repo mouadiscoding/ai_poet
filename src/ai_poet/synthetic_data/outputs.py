@@ -11,6 +11,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from .config import GenerationSettings
+from .errors import classify_generation_failure
 from .poems import PoemRecord
 from .prompts.templates import TEMPLATE_VERSION
 
@@ -54,6 +55,8 @@ def write_outputs(
     pilot_report_fingerprint: str | None = None,
     pilot_review_fingerprint: str | None = None,
     endpoint_metrics: dict[str, Any] | None = None,
+    max_couplets: int | None = None,
+    excluded_long_poems: int = 0,
 ) -> None:
     """Materialize generated records, failures, and a run manifest.
 
@@ -74,6 +77,8 @@ def write_outputs(
         settings: Generation configuration to describe in the manifest.
         source_fingerprint: Optional SHA-256 digest of the source dataset.
         trace_run_id: Optional audit run identifier recorded in the manifest.
+        max_couplets: Optional poem-size selection cap used for this run.
+        excluded_long_poems: Number of poems removed by that cap.
 
     Raises:
         OSError: If the output directory or any output file cannot be written.
@@ -85,7 +90,11 @@ def write_outputs(
     if ordered:
         pq.write_table(pa.Table.from_pylist(ordered), output_dir / "ashaar_sft.parquet")
     failure_records = [
-        {"sample_id": sample_id, "error": error}
+        {
+            "sample_id": sample_id,
+            "category": classify_generation_failure(error),
+            "error": error,
+        }
         for sample_id, error in sorted(failures.items())
         if sample_id not in successes
     ]
@@ -95,6 +104,13 @@ def write_outputs(
         "source_poems": len(poems),
         "generated_poems": len(ordered),
         "unresolved_failures": len(failure_records),
+        "failure_categories": dict(
+            Counter(record["category"] for record in failure_records)
+        ),
+        "selection": {
+            "max_couplets": max_couplets,
+            "excluded_long_poems": excluded_long_poems,
+        },
         "model": settings.model,
         "endpoint": settings.endpoint,
         "endpoints": [

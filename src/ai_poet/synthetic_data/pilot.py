@@ -176,6 +176,7 @@ def run_pilot(settings: PilotSettings) -> int:
         per_sample_chunk_cap=settings.per_sample_chunk_cap,
         enforce_pilot_gate=False,
         selected_sample_ids=frozenset(poem.sample_id for poem in selected),
+        max_couplets=None,
     )
     started = time.perf_counter()
     run(run_settings)

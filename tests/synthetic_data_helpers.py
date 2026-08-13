@@ -79,6 +79,7 @@ def valid_reasoning_value(
     ]
     blocks = []
     for offset, couplet in enumerate(selected, start=start_offset + 1):
+        target_word = next(word for word in couplet.split() if len(word) >= 3)
         blocks.append(
             {
                 "verse_index": offset,
@@ -86,7 +87,11 @@ def valid_reasoning_value(
                 "connection_to_previous": "أصله بما قبله، أو أجعله مطلعًا ممهدًا إن كان أول بيت.",
                 "imagery_and_diction": "أختار صورة الضوء وأوازن بين اللفظ المباشر والصورة البلاغية.",
                 "first_draft": f"مسودة مختلفة لصدر البيت {offset} = ومسودة مختلفة لعجزه",
-                "problem_with_first_draft": "عبارة مسودة مختلفة تقريرية وفي إيقاعها ثقل؛ لذلك أستبدلها بصورة الضوء وأخفف ترتيب العجز.",
+                "problem_with_first_draft": (
+                    "عبارة مسودة مختلفة تقريرية وفي إيقاعها ثقل؛ لذلك أستبدل "
+                    f"لفظ مسودة بلفظ {target_word} الظاهر في الصياغة المنقحة "
+                    "وأخفف ترتيب العجز."
+                ),
                 "revised_draft": couplet,
                 "first_hemistich_scansion": "أنطق الصدر موصولًا وأقسمه إلى تفعيلات البحر مع فك الشدة.",
                 "second_hemistich_scansion": "أنطق العجز وأراجع حدوده الصوتية وموضع الضرب في آخره.",

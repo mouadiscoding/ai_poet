@@ -30,6 +30,9 @@ from tests.synthetic_data_helpers import (
 )
 
 class PipelineTests(unittest.TestCase):
+    def tearDown(self) -> None:
+        remove_test_files("failures.jsonl")
+
     def test_api_trace_contains_full_exchange_and_redacts_secret(self) -> None:
         class FakeResponse:
             def __enter__(self):
@@ -192,9 +195,23 @@ class PipelineTests(unittest.TestCase):
     def test_malformed_gemma_verdict_is_never_exported(self) -> None:
         poem = make_poem()
         candidate = json.dumps(valid_instruction_value(poem), ensure_ascii=False)
-        client = QueueClient([candidate, "{}"])
+        client = QueueClient([candidate, "{}", "{}", "{}"])
         with self.assertRaises(GenerationError):
             generate_one(poem, client, settings())
+
+    def test_malformed_gemma_verdict_is_retried_independently(self) -> None:
+        poem = make_poem()
+        outputs = valid_pipeline_outputs(poem)
+        outputs[1:2] = ["not json", json.dumps(valid_verdict(), ensure_ascii=False)]
+        client = QueueClient(outputs)
+
+        record = generate_one(poem, client, settings())
+
+        self.assertEqual(record["instruction_generation_attempts"], 1)
+        self.assertEqual(
+            client.call_kwargs[2]["trace_context"]["validator_format_attempt"],
+            2,
+        )
 
     def test_oversized_poem_is_summarized_then_generated(self) -> None:
         poem = make_poem(verses=("أ" * 30, "ب" * 30, "ج" * 30, "د" * 30))
@@ -315,6 +332,28 @@ class PipelineTests(unittest.TestCase):
             [{"sample_id": "first"}, {"sample_id": "second"}],
         )
 
+    def test_failure_exports_include_categories_and_selection_counts(self) -> None:
+        poem = make_poem()
+        generated_files = ("ashaar_sft.jsonl", "failures.jsonl", "manifest.json")
+        remove_test_files(*generated_files)
+        self.addCleanup(remove_test_files, *generated_files)
+
+        write_outputs(
+            TEST_TMP,
+            [poem],
+            {},
+            {poem.sample_id: "Gemma rejected reasoning: contradiction"},
+            settings(),
+            max_couplets=24,
+            excluded_long_poems=3,
+        )
+
+        failure = json.loads((TEST_TMP / "failures.jsonl").read_text("utf-8"))
+        manifest = json.loads((TEST_TMP / "manifest.json").read_text("utf-8"))
+        self.assertEqual(failure["category"], "semantic_rejection")
+        self.assertEqual(manifest["failure_categories"], {"semantic_rejection": 1})
+        self.assertEqual(manifest["selection"]["excluded_long_poems"], 3)
+
     def test_run_publishes_sft_record_before_final_export(self) -> None:
         poem = make_poem()
         record = generate_one(
@@ -386,3 +425,60 @@ class PipelineTests(unittest.TestCase):
             self.assertEqual(run(run_settings), 0)
 
         generate.assert_called_once()
+
+    def test_run_excludes_long_poems_and_schedules_shortest_first(self) -> None:
+        def poem_with_count(count: int):
+            return make_poem(
+                verses=tuple(
+                    part
+                    for index in range(count)
+                    for part in (
+                        f"صدر فريد {count}-{index}",
+                        f"عجز فريد {count}-{index}",
+                    )
+                )
+            )
+
+        medium = poem_with_count(4)
+        excluded = poem_with_count(25)
+        short = poem_with_count(2)
+        generated_files = (
+            "generation_checkpoint.jsonl",
+            "ashaar_sft.jsonl",
+            "failures.jsonl",
+        )
+        remove_test_files(*generated_files)
+        self.addCleanup(remove_test_files, *generated_files)
+        run_settings = RunSettings(
+            input=TEST_TMP / "source.parquet",
+            output_dir=TEST_TMP,
+            concurrency=1,
+            limit=None,
+            trace=False,
+            generation=settings(),
+            max_couplets=24,
+        )
+        call_order: list[str] = []
+
+        def generate(poem, *_args, **_kwargs):
+            call_order.append(poem.sample_id)
+            return {"sample_id": poem.sample_id, "template_version": TEMPLATE_VERSION}
+
+        with (
+            patch(
+                "ai_poet.synthetic_data.runner.load_poems",
+                return_value=[medium, excluded, short],
+            ),
+            patch(
+                "ai_poet.synthetic_data.runner.file_sha256",
+                return_value="source-digest",
+            ),
+            patch("ai_poet.synthetic_data.runner.generate_one", side_effect=generate),
+            patch("ai_poet.synthetic_data.runner.write_outputs") as write_outputs,
+            redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(run(run_settings), 0)
+
+        self.assertEqual(call_order, [short.sample_id, medium.sample_id])
+        self.assertEqual(write_outputs.call_args.kwargs["excluded_long_poems"], 1)
+        self.assertEqual(write_outputs.call_args.kwargs["max_couplets"], 24)

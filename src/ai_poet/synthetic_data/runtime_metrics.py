@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 import json
 from pathlib import Path
 import threading
@@ -33,6 +34,7 @@ class GenerationProgress:
         self.completed = initial_completed
         self.successes = initial_completed
         self.failures = 0
+        self.failure_categories: Counter[str] = Counter()
         self.repaired = initial_repaired
         self.response_characters = initial_response_characters
         self.started = time.monotonic()
@@ -47,10 +49,11 @@ class GenerationProgress:
             )
             self.response_characters += len(str(record.get("response", "")))
 
-    def record_failure(self) -> None:
+    def record_failure(self, category: str = "generation_error") -> None:
         with self._lock:
             self.completed += 1
             self.failures += 1
+            self.failure_categories[category] += 1
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
@@ -68,6 +71,7 @@ class GenerationProgress:
                     "completed_samples": self.completed,
                     "successful_samples": self.successes,
                     "failed_samples": self.failures,
+                    "failure_categories": dict(self.failure_categories),
                     "repaired_samples": self.repaired,
                     "repair_rate": (
                         self.repaired / self.successes if self.successes else 0.0

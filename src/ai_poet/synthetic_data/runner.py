@@ -24,7 +24,7 @@ from .checkpoint import (
 from .client import GemmaClient, GemmaPoolClient
 from .config import RunSettings
 from .corpus import load_poems
-from .errors import GemmaConnectionError
+from .errors import GemmaConnectionError, classify_generation_failure
 from .generation import TEMPLATE_RATIONALE, generate_one
 from .outputs import append_jsonl, write_jsonl, write_outputs
 from .poems import PoemRecord, split_poem_chunks
@@ -46,7 +46,7 @@ def file_sha256(path: Path) -> str:
 
 
 def estimated_request_work(poem: PoemRecord, run_settings: RunSettings) -> int:
-    """Estimate logical calls so longest-processing-time scheduling is stable."""
+    """Estimate logical calls so shortest-processing-time scheduling is stable."""
     reasoning_chunks = math.ceil(poem.couplet_count / 3)
     oversized_chunks = (
         len(split_poem_chunks(poem.verses, run_settings.generation.chunk_chars))
@@ -73,6 +73,8 @@ def _trace_run_start(
     pending: int,
     reused: int,
     capacity: CapacityPlan | None,
+    max_couplets: int | None,
+    excluded_long_poems: int,
 ) -> None:
     if tracer is None:
         return
@@ -85,6 +87,8 @@ def _trace_run_start(
             "selected_poems": selected,
             "checkpoint_reused": reused,
             "pending_generation": pending,
+            "max_couplets": max_couplets,
+            "excluded_long_poems": excluded_long_poems,
             "model": settings.model,
             "endpoints": [
                 {
@@ -135,8 +139,23 @@ def run(run_settings: RunSettings) -> int:
         poems = [
             poem for poem in poems if poem.sample_id in run_settings.selected_sample_ids
         ]
+    excluded_long_poems = 0
+    if run_settings.max_couplets is not None:
+        eligible = [
+            poem for poem in poems if poem.couplet_count <= run_settings.max_couplets
+        ]
+        excluded_long_poems = len(poems) - len(eligible)
+        poems = eligible
+        if excluded_long_poems:
+            with PRINT_LOCK:
+                print(
+                    f"Excluded {excluded_long_poems} poems above "
+                    f"--max-couplets={run_settings.max_couplets}."
+                )
     if run_settings.limit is not None:
         poems = poems[: run_settings.limit]
+    if not poems:
+        raise ValueError("No poems remain after applying the selection filters")
     source_fingerprint = file_sha256(run_settings.input)
     contract_fingerprint = workflow_fingerprint(settings, source_fingerprint)
 
@@ -165,7 +184,7 @@ def run(run_settings: RunSettings) -> int:
     }
     pending = [poem for poem in poems if poem.sample_id not in successes]
     pending.sort(
-        key=lambda poem: (-estimated_request_work(poem, run_settings), poem.sample_id)
+        key=lambda poem: (estimated_request_work(poem, run_settings), poem.sample_id)
     )
 
     capacity: CapacityPlan | None = None
@@ -209,6 +228,8 @@ def run(run_settings: RunSettings) -> int:
         len(pending),
         len(poems) - len(pending),
         capacity,
+        run_settings.max_couplets,
+        excluded_long_poems,
     )
 
     if capacity is None:
@@ -253,6 +274,8 @@ def run(run_settings: RunSettings) -> int:
             if poem.sample_id in successes
         ),
     )
+    failures_jsonl = run_settings.output_dir / "failures.jsonl"
+    write_jsonl(failures_jsonl, ())
     checkpoint_writer = CheckpointWriter(checkpoint_path)
     completed = len(poems) - len(pending)
     try:
@@ -305,27 +328,39 @@ def run(run_settings: RunSettings) -> int:
                     for secret in settings.secrets:
                         error = error.replace(secret, "[REDACTED]")
                     failures[poem.sample_id] = error
+                    failure_category = classify_generation_failure(error)
                     event = {
                         "event": "sample_failure",
                         "sample_id": poem.sample_id,
                         "generation_fingerprint": contract_fingerprint,
+                        "category": failure_category,
                         "error": error,
                     }
                     status = "failed"
                     if progress is not None:
-                        progress.record_failure()
+                        progress.record_failure(failure_category)
                     if tracer is not None:
                         tracer.emit(
                             {
                                 "event": "sample_failure",
                                 "sample_id": poem.sample_id,
                                 "error_type": type(exc).__name__,
+                                "category": failure_category,
                                 "error": error,
                             }
                         )
                 checkpoint_writer.append(event)
                 if status == "ok":
                     append_jsonl(sft_jsonl, record)
+                else:
+                    append_jsonl(
+                        failures_jsonl,
+                        {
+                            "sample_id": poem.sample_id,
+                            "category": failure_category,
+                            "error": error,
+                        },
+                    )
                 with PRINT_LOCK:
                     print(
                         f"[{completed}/{len(poems)}] "
@@ -354,6 +389,8 @@ def run(run_settings: RunSettings) -> int:
         pilot_report_fingerprint=pilot_report_fingerprint,
         pilot_review_fingerprint=pilot_review_fingerprint,
         endpoint_metrics=endpoint_metrics,
+        max_couplets=run_settings.max_couplets,
+        excluded_long_poems=excluded_long_poems,
     )
     unresolved = [poem for poem in poems if poem.sample_id not in successes]
     if tracer is not None:
@@ -365,6 +402,8 @@ def run(run_settings: RunSettings) -> int:
                     poem.sample_id in successes for poem in pending
                 ),
                 "unresolved_failures": len(unresolved),
+                "max_couplets": run_settings.max_couplets,
+                "excluded_long_poems": excluded_long_poems,
                 "complete": not unresolved,
                 "template_distribution": dict(
                     Counter(record["template_id"] for record in successes.values())

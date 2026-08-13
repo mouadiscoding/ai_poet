@@ -29,6 +29,8 @@ found:
 | Unique poem texts | 50,193 |
 | Duplicate source rows beyond the unique texts | 6 |
 | Distinct poem-text groups with conflicting meter metadata | 1 |
+| Poems at or below the default 24-couplet SFT cap | 45,161 |
+| Poems excluded by the default couplet cap | 5,032 |
 | Poems longer than the default 24,000-character direct-input limit | 26 |
 | Rows with an even, non-empty hemistich list | 50,199 |
 
@@ -194,10 +196,16 @@ anything after an accidental result marker, then appends exactly one canonical
 marker and the exact source poem. The endpoint therefore cannot rewrite, normalize,
 re-diacritize, or hallucinate the final target.
 
-## Oversized-poem processing
+## Poem-size controls
 
-The direct source limit defaults to 24,000 characters. A longer poem is split
-at complete-couplet boundaries into chunks of at most 12,000 characters.
+The SFT generator excludes poems above `--max-couplets` before applying
+`--limit`. Its default of 24 bounds one training record to at most eight
+three-couplet reasoning chunks. Raising the cap is an explicit choice to target
+a larger downstream training context.
+
+For an admitted poem, the direct source limit defaults to 24,000 characters. A
+longer poem is split at complete-couplet boundaries into chunks of at most
+12,000 characters.
 
 For each source-size chunk, the endpoint receives a compact-analysis request.
 The ordered summaries are used only by the global instruction stage. Editorial
@@ -211,8 +219,8 @@ complete original poem is still appended to the response. Such rows receive:
 oversized_for_sft = true
 ```
 
-This flag is important: retaining every poem in the master dataset does not
-mean every row fits the context length of a downstream training model.
+This flag remains useful when the couplet cap is raised: admitting a poem does
+not by itself prove the finished record fits a downstream model's context.
 
 ### Authentication and TLS
 
@@ -302,8 +310,8 @@ substantive. Each review returns exactly:
 
 Instruction failures repair only the instruction before verse generation
 begins. A failed reasoning chunk is repaired independently, so accepted chunks
-are not regenerated. Malformed verdicts fail safely. Network retries remain
-separate from content repairs.
+are not regenerated. Malformed verdicts are retried up to three times and
+remain separate from candidate repairs and network retries.
 
 ## Checkpoint and resume semantics
 
@@ -323,15 +331,18 @@ restart, compatible accepted instructions and chunks are reused; missing stages
 alone are submitted again. Compatibility is enforced through the model,
 endpoint, prompt-template, and generation-settings fingerprint. Legacy
 success/failure events remain readable, and a successful record is reused only
-when its `template_version` is 7.
+when its `template_version` is 8.
 
 All checkpoint appends pass through a locked writer and are flushed, so
 concurrent chunk completions cannot interleave JSON lines. Each successful SFT
 record is appended and flushed to `ashaar_sft.jsonl`; the finished file is
 rewritten in canonical source order.
 
-When `--limit` is used, checkpoint entries outside the selected prefix are
-ignored for that run. The command returns exit code 1 while any selected sample
+Poems above `--max-couplets` are excluded before `--limit` is applied. The
+default is 24 couplets; the manifest records both the configured cap and the
+number excluded. Eligible poems are scheduled shortest-first. When `--limit`
+is used, checkpoint entries outside the selected prefix are ignored for that
+run. The command returns exit code 1 while any selected sample
 is unresolved, exit code 2 for invalid configuration or input, and exit code 0
 only when all selected samples have valid records.
 
@@ -370,7 +381,7 @@ The pipeline writes the same logical records to `ashaar_sft.jsonl` and
 | `meter_name` | Decoded Arabic base-meter name |
 | `couplet_count` | Number of hemistich pairs |
 | `template_id` | Selected concrete prompt template |
-| `template_version` | Prompt and validation contract version; currently `7` |
+| `template_version` | Prompt and validation contract version; currently `8` |
 | `instruction` | Generated Arabic user instruction |
 | `response` | Generated reasoning plus exact source poem |
 | `messages` | Two-message chat SFT representation |
@@ -402,12 +413,13 @@ The output directory also contains:
 - `generation_trace.jsonl` when `--trace` is enabled
 - `generation_metrics.jsonl` for lightweight 60-second pool telemetry
 - `pilot_report.json` and `pilot_review.json` for the strict production gate
-- `failures.jsonl`
+- `failures.jsonl`, updated live with `sample_id`, failure `category`, and error
 - `manifest.json`
 
 The manifest records completion status, source SHA-256, template version, model
 and endpoint, decoding and length settings, output counts, split distribution,
-template distribution, oversized count, and metadata-conflict count.
+template distribution, couplet-cap selection counts, oversized count, and
+metadata-conflict count.
 
 The trace file is intentionally a sidecar rather than part of the training
 schema. Complete prompts repeat the few-shot demonstrations, rejected outputs
@@ -471,6 +483,7 @@ uv run ai-poet-generate-sft `
   --capacity-report data/gemma_capacity/endpoint_capacity.json `
   --pilot-report data/ashaar_sft/pilot_report.json `
   --pilot-review data/ashaar_sft/pilot_review.json `
+  --max-couplets 24 `
   --insecure
 ```
 
@@ -508,7 +521,8 @@ Before a full production run is accepted, verify that:
 
 1. A live smoke sample has been inspected manually.
 2. The manifest reports `complete: true`.
-3. `generated_poems` equals 50,193 for the current full source.
+3. `generated_poems` equals the selected eligible count (45,161 with the
+   current corpus and default 24-couplet cap).
 4. `unresolved_failures` is zero.
 5. The JSONL and Parquet files both load successfully.
 6. Oversized records are filtered or retained according to the downstream

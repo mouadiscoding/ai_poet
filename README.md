@@ -102,6 +102,7 @@ uv run ai-poet-generate-sft `
   --capacity-report data/gemma_capacity/endpoint_capacity.json `
   --pilot-report data/ashaar_sft/pilot_report.json `
   --pilot-review data/ashaar_sft/pilot_review.json `
+  --max-couplets 24 `
   --insecure
 ```
 
@@ -119,35 +120,40 @@ set of controls.
 Accepted instructions and reasoning chunks are appended immediately to the
 versioned `generation_checkpoint.jsonl`, followed by the final sample event.
 Re-running skips compatible accepted stages as well as successful
-template-version-7 samples. Transient failures retry across healthy endpoints;
+template-version-8 samples. Transient failures retry across healthy endpoints;
 429s, timeouts, latency pressure, and repeated server failures reduce only the
 affected endpoint's capacity. The run stops for a connection outage only when
 all endpoints exhaust the shared retry budget. Responses that cannot be
 parsed receive phase-specific repair prompts. Python first validates the
 instruction layout and then requires exactly
-one structured work block per source couplet. Every accepted revision must
-match its source couplet exactly, while its first draft must differ, and
+one structured work block per source couplet. Every accepted revision is
+canonicalized back to its source couplet after Unicode normalization and
+harmless spacing around `=` are checked, while its first draft must differ, and
 generation metatext is rejected. Gemma then performs a separate semantic review
 of the instruction and the editorial content of each bounded reasoning chunk.
 Exact scansion remains outside that same-model semantic gate; the scansion
 fields are retained in the response but require purpose-built or expert review.
 Pre-draft imagery is required to use planning language, while the later
 revision decision must identify a real defect in the first draft and the
-concrete change that leads to the accepted verse.
+concrete change that leads to the accepted verse. That decision must cite
+wording present in both drafts. Malformed semantic-verdict JSON is retried up to
+three times without consuming a candidate-repair attempt.
 
 Each successful record is also appended and flushed immediately to
 `ashaar_sft.jsonl`, so the training data can be inspected while generation is
 still running. The file is rewritten in source order when the run finishes.
 
 The run returns a non-zero exit status while any selected poem remains
-unresolved. `failures.jsonl` records those failures without storing request
-headers or credentials.
+unresolved. `failures.jsonl` is updated during the run and records a stable
+failure category with each error, without storing request headers or credentials.
 
-Poems longer than 24,000 characters are analyzed in couplet-aligned chunks for
-the global instruction. Analysis and three-couplet reasoning chunks run in
-bounded parallelism, are assembled in source order, and are checkpointed
-independently. The final SFT record still includes the complete source poem and
-marks oversized source texts with `oversized_for_sft=true`.
+By default, poems above 24 couplets are excluded before `--limit` is applied;
+override this with `--max-couplets`. For the current corpus this selects 45,161
+poems and excludes 5,032. Eligible work is scheduled shortest-first so useful
+records and acceptance-rate evidence appear early. If the cap is raised enough
+to admit a poem longer than 24,000 characters, it is analyzed in
+couplet-aligned chunks for the global instruction. Three-couplet reasoning
+chunks are assembled in source order and checkpointed independently.
 
 ## Outputs
 

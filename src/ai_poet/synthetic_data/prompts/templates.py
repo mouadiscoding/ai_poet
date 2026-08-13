@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
-TEMPLATE_VERSION = 7
+TEMPLATE_VERSION = 8
 
 ALL_FOCUS_REQUIREMENTS = """عالج المحاور الستة الآتية كلها من غير اختلاق ما لا يثبته المرجع:
 1. الوزن أو الإيقاع والقافية والجرس والنطق عند انطباقه.
