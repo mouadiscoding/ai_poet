@@ -453,6 +453,36 @@ GEMMA_API_KEY_3=replace-with-endpoint-3-token
 GEMMA_MAX_CONCURRENCY_3=32
 ```
 
+### Running with one endpoint
+
+For a single-endpoint run, replace the indexed endpoint settings above with
+the legacy, unindexed variables:
+
+```dotenv
+GEMMA_ENDPOINT=https://your-host.example/v1/chat/completions
+GEMMA_MODEL=your-model-name
+GEMMA_API_KEY=replace-with-endpoint-token
+```
+
+Do not leave any `GEMMA_ENDPOINT_1..3`, `GEMMA_MODEL_1..3`,
+`GEMMA_API_KEY_1..3`, `GEMMA_MAX_CONCURRENCY_1..3`, or
+`GEMMA_METRICS_URL_1..3` variables in `.env` or the process environment;
+indexed and unindexed settings cannot be mixed. Then run the generator without
+capacity or pilot artifacts:
+
+```powershell
+uv run ai-poet-generate-sft `
+  --input data/ashaar_classic_moroccan.parquet `
+  --output-dir data/ashaar_sft_single `
+  --concurrency 32 `
+  --max-couplets 24 `
+  --insecure
+```
+
+In single-endpoint mode, `--concurrency` sets the number of concurrent sample
+workers; choose a value within that endpoint's safe capacity. Omit `--insecure`
+when the endpoint presents a certificate trusted by the local system.
+
 Certify the endpoint capacities:
 
 ```powershell
