@@ -126,23 +126,48 @@ be reused across workflows. When `--output-dir` is omitted, MCQ and
 reconstruction default to `data/ashaar_mcq_sft` and
 `data/ashaar_reconstruction_sft` respectively.
 
-For example, a single-endpoint smoke run can skip the production gate:
+#### Running MCQ with one endpoint
+
+For a single endpoint, configure only the unindexed variables in `.env` and
+remove any `GEMMA_ENDPOINT_1..3`, `GEMMA_MODEL_1..3`, and
+`GEMMA_API_KEY_1..3` entries:
+
+```dotenv
+GEMMA_ENDPOINT=https://your-host.example/v1/chat/completions
+GEMMA_MODEL=your-model-name
+GEMMA_API_KEY=replace-with-endpoint-token
+```
+
+Then run MCQ generation directly; single-endpoint runs do not require capacity
+or pilot artifacts:
 
 ```powershell
 uv run ai-poet-generate-sft `
+  --input data/ashaar_classic_moroccan.parquet `
   --task mcq `
-  --limit 10 `
-  --skip-pilot-review `
-  --trace
+  --output-dir data/ashaar_mcq_sft `
+  --concurrency 32 `
+  --max-couplets 24 `
+  --insecure
 ```
+
+#### Running reconstruction with one endpoint
+
+Using the same unindexed `.env` configuration:
 
 ```powershell
 uv run ai-poet-generate-sft `
+  --input data/ashaar_classic_moroccan.parquet `
   --task poem-reconstruction `
-  --limit 10 `
-  --skip-pilot-review `
-  --trace
+  --output-dir data/ashaar_reconstruction_sft `
+  --concurrency 32 `
+  --max-couplets 24 `
+  --insecure
 ```
+
+Choose `--concurrency` within the endpoint's tested capacity. Omit `--insecure`
+when its TLS certificate is trusted. For a small inspection run, add
+`--limit 10 --trace` to either command.
 
 MCQ and reconstruction always send the complete selected poem. They fail
 before contacting Gemma if a selected poem exceeds `--max-source-chars`; they
