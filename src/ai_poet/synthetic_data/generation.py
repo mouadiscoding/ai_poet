@@ -247,6 +247,10 @@ def generate_one(
 
     response = compose_qcm_response(qcm, poem)
     repaired = generation_attempts > 1
+    instruction = (
+        "اقرأ القصيدة التالية بعناية، ثم أجب عن السؤال المطروح باختيار "
+        "الإجابة الصحيحة من بين الخيارات الأربعة، مع تقديم الاستدلال المناسب."
+    )
     record = {
         "sample_id": poem.sample_id,
         "source_row_indices": list(poem.source_row_indices),
@@ -256,6 +260,7 @@ def generate_one(
         "meter_id": poem.meter_id,
         "meter_name": poem.meter_name,
         "couplet_count": poem.couplet_count,
+        "instruction": instruction,
         "poem": poem.poem_text,
         "question": qcm["question"],
         "choices": qcm["choices"],
