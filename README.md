@@ -2,16 +2,20 @@
 
 This project builds a supervised fine-tuning dataset from
 `data/ashaar_classic_moroccan.parquet`. For every unique poem it asks an
-OpenAI-compatible Gemma endpoint to reverse-construct a detailed Arabic writing
-instruction. In a separate stage, it generates a structured editorial worklog
-for every couplet, including a rejected draft, revision reason, accepted line,
-prosodic or rhythmic review, and rhyme review. The program then renders those
-blocks and appends the original poem itself.
+OpenAI-compatible Gemma endpoint to generate a poem-grounded multiple-choice
+question (QCM). The question must be determinable from the poem itself, cover
+an aspect that is actually present in the text, and offer four plausible
+choices with exactly one correct answer. The response includes a demonstrative
+reasoning that explains why the correct answer is correct and why the other
+choices are less suited, followed by the exact source poem.
 
-The generator randomly chooses one of six concrete prompt templates for each
-poem. Every template and every few-shot example covers prosody or internal
-rhythm, semantic progression, imagery, voice, occasion, and diction/revision.
-Metered and prose poems have separate demonstrations.
+The generator randomly chooses one of four concrete QCM prompt templates for
+each poem. Every template and every few-shot example requires a poem-grounded
+question, four plausible choices, and a demonstrative reasoning that follows
+the full conceptual path from question to answer. The question categories are
+chosen from the poem's actual content, so the type of question varies naturally
+across poems instead of being fixed. Metered and prose poems have separate
+demonstrations.
 
 See [the complete SFT generation guide](docs/sft_dataset_generation.md) for the
 corpus audit, prompt architecture, validation contract, output schema, and
@@ -62,11 +66,11 @@ uv run ai-poet-generate-sft `
 same structured events to `generation_trace.jsonl`. The trace shows the
 concrete-template catalog and rationale, the fresh random selection, every
 complete message array sent to Gemma, raw generation and Gemma-validation
-payloads, repair results, and the final response after the source poem is
-appended. Use it for smoke runs and audits; full-corpus traces are very large.
+payloads, repair results, and the final QCM response with the source poem
+included. Use it for smoke runs and audits; full-corpus traces are very large.
 
-Inspect the generated instructions and reasoning before starting the complete
-run:
+Inspect the generated questions, choices, and reasoning before starting the
+complete run:
 
 ```powershell
 uv run ai-poet-generate-sft `
@@ -85,21 +89,17 @@ context-size controls.
 
 Every completed request is appended immediately to
 `generation_checkpoint.jsonl`. Re-running the same command skips successful
-template-version-7 sample IDs and retries unresolved or legacy successes.
+template-version-8 sample IDs and retries unresolved or legacy successes.
 Transient HTTP failures are retried up to three times with exponential
 backoff. Connection failures use the same backoff and stop the entire script if
 Gemma is still unreachable after the third retry. Responses that cannot be
-parsed receive phase-specific repair prompts. Python first validates the
-instruction layout and then requires exactly
-one structured work block per source couplet. Every accepted revision must
-match its source couplet exactly, while its first draft must differ, and
-generation metatext is rejected. Gemma then performs a separate semantic review
-of the instruction and the editorial content of each bounded reasoning chunk.
-Exact scansion remains outside that same-model semantic gate; the scansion
-fields are retained in the response but require purpose-built or expert review.
-Pre-draft imagery is required to use planning language, while the later
-revision decision must identify a real defect in the first draft and the
-concrete change that leads to the accepted verse.
+parsed receive phase-specific repair prompts. Python first validates the QCM
+structure: a non-empty question, exactly four non-empty choices under A, B, C,
+and D, a sufficiently detailed reasoning that references the question or the
+choices, and a correct answer that matches one of the choices. Generation
+metatext and generic one-line reasoning are rejected. Gemma then performs a
+separate semantic review of the question, the choices, and the demonstrative
+reasoning against the source poem.
 
 Each successful record is also appended and flushed immediately to
 `ashaar_sft.jsonl`, so the training data can be inspected while generation is
@@ -109,11 +109,11 @@ The run returns a non-zero exit status while any selected poem remains
 unresolved. `failures.jsonl` records those failures without storing request
 headers or credentials.
 
-Poems longer than 24,000 characters are analyzed in couplet-aligned chunks for
-the global instruction. Editorial reasoning is always generated in bounded
-three-couplet chunks, so long poems do not require one oversized completion. The
-final SFT record still includes the complete source poem and marks oversized
-source texts with `oversized_for_sft=true`.
+Poems longer than 24,000 characters are analyzed in couplet-aligned chunks, and
+the summaries from all chunks are combined so the QCM question is built from
+the poem as a whole rather than from a single chunk. The final SFT record still
+includes the complete source poem and marks oversized source texts with
+`oversized_for_sft=true`.
 
 ## Outputs
 
@@ -128,12 +128,13 @@ The output directory contains:
 - `manifest.json`: generation settings and aggregate counts.
 
 Each training record includes the source hash and provenance, meter ID and
-name, couplet count, concrete template ID and version, generated `instruction`,
-composed `response`, OpenAI-style `messages`, deterministic `sft_split`, and
-quality flags. Exact
-duplicate poem texts share one record and retain all source row indices and
-URLs. Splits are assigned from the poem hash using 98% train, 1% validation,
-and 1% test buckets.
+name, couplet count, concrete template ID and version, the exact source poem,
+the generated `question`, the four `choices`, the demonstrative `reasoning`,
+the `correct_answer` letter and its text, composed `response`, OpenAI-style
+`messages`, deterministic `sft_split`, and quality flags. Exact duplicate poem
+texts share one record and retain all source row indices and URLs. Splits are
+assigned from the poem hash using 98% train, 1% validation, and 1% test
+buckets.
 
 Full prompts and raw model responses are deliberately excluded from
 `ashaar_sft.jsonl` and `ashaar_sft.parquet`. Keeping them in the separate trace
@@ -142,25 +143,31 @@ and avoids inflating every trainer-facing row. Each trace run has a unique
 `run_id`, which is also recorded in the manifest. Request headers and API keys
 are never traced; configured secrets are recursively redacted from event data.
 
-The assistant message contains synthetic editorial reasoning followed by the
-source poem formatted as:
+The assistant message contains the source poem followed by the question, the
+four choices, the reasoning, and the correct answer formatted as:
 
 ```text
-مرحلة التفكير والتحرير:
+<القصيدة الأصلية>
 
-<خطة القصيدة>
+السؤال:
+<السؤال>
 
-البيت 1:
-<المعنى، المسودة، سبب المراجعة، الصياغة المنقحة، والفحص العروضي والقافية>
+الخيارات:
+A. <الخيار أ>
+B. <الخيار ب>
+C. <الخيار ج>
+D. <الخيار د>
 
-النتيجة النهائية:
+الاستدلال:
+<الاستدلال>
 
-صدر البيت = عجز البيت
+الإجابة الصحيحة: <الحرف>
+<نص الإجابة الصحيحة>
 ```
 
-Because the pipeline starts from an existing poem, the worklog is a synthetic
-editorial reconstruction, not a claim about the historical poet's private
-thoughts.
+Because the pipeline starts from an existing poem, the QCM is a question about
+the poem's observable content and is not a claim about the historical poet's
+private intentions.
 
 ## Tests
 

@@ -2,17 +2,18 @@
 
 from __future__ import annotations
 
-from collections import Counter
 import json
+from collections import Counter
+from collections.abc import Iterable, Sequence
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 
 from .config import GenerationSettings
 from .poems import PoemRecord
-from .prompts.templates import TEMPLATE_VERSION
+from .prompts.qcm_templates import QCM_TEMPLATE_VERSION
 
 
 def write_jsonl(path: Path, records: Iterable[dict[str, Any]]) -> None:
@@ -76,7 +77,9 @@ def write_outputs(
         TypeError: If records or manifest values cannot be serialized.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
-    ordered = [successes[poem.sample_id] for poem in poems if poem.sample_id in successes]
+    ordered = [
+        successes[poem.sample_id] for poem in poems if poem.sample_id in successes
+    ]
     write_jsonl(output_dir / "ashaar_sft.jsonl", ordered)
     if ordered:
         pq.write_table(pa.Table.from_pylist(ordered), output_dir / "ashaar_sft.parquet")
@@ -94,7 +97,7 @@ def write_outputs(
         "model": settings.model,
         "endpoint": settings.endpoint,
         "source_sha256": source_fingerprint,
-        "template_version": TEMPLATE_VERSION,
+        "template_version": QCM_TEMPLATE_VERSION,
         "generation": {
             "temperature": settings.temperature,
             "top_p": settings.top_p,

@@ -1,16 +1,21 @@
 from __future__ import annotations
 
 import json
-from string import Formatter
 import unittest
+from string import Formatter
 
+from ai_poet.synthetic_data.meters import METER_NAMES
 from ai_poet.synthetic_data.prompts.builder import (
     build_instruction_validation_messages,
     build_messages,
+    build_qcm_messages,
+    build_qcm_validation_messages,
     build_reasoning_messages,
     build_reasoning_validation_messages,
 )
-from ai_poet.synthetic_data.meters import METER_NAMES
+from ai_poet.synthetic_data.prompts.qcm_templates import (
+    QCM_PROMPT_TEMPLATES,
+)
 from ai_poet.synthetic_data.prompts.templates import (
     ALL_FOCUS_REQUIREMENTS,
     METER_DEFINITIONS,
@@ -18,12 +23,13 @@ from ai_poet.synthetic_data.prompts.templates import (
     meter_explanation,
     plan_heading,
 )
+
 from tests.synthetic_data_helpers import (
     make_poem,
     valid_instruction_value,
+    valid_qcm_value,
     valid_reasoning_value,
 )
-
 
 FOCUS_TERM_GROUPS = (
     ("وزن", "إيقاع"),
@@ -130,9 +136,7 @@ class TemplateTests(unittest.TestCase):
                     example["instruction"].index(heading)
                     for heading in REQUIRED_INSTRUCTION_HEADINGS
                 ]
-                positions.append(
-                    example["instruction"].index("خطة عملية لصناعة")
-                )
+                positions.append(example["instruction"].index("خطة عملية لصناعة"))
                 self.assertEqual(positions, sorted(positions))
                 for terms in FOCUS_TERM_GROUPS:
                     self.assertTrue(
@@ -151,9 +155,7 @@ class TemplateTests(unittest.TestCase):
             )
             self.assertIn("بلا وزن خليلي", messages[-1]["content"])
             self.assertIn("الإيقاع الداخلي", messages[-1]["content"])
-            self.assertIn(
-                "خطة عملية لصناعة نص شعري منثور:", messages[-1]["content"]
-            )
+            self.assertIn("خطة عملية لصناعة نص شعري منثور:", messages[-1]["content"])
 
     def test_reasoning_prompt_requires_one_structured_block_per_target(self) -> None:
         poem = make_poem()
@@ -184,6 +186,51 @@ class TemplateTests(unittest.TestCase):
             self.assertIn(couplet, prompt)
         example = json.loads(messages[2]["content"])
         self.assertGreaterEqual(len(example["verse_reasoning"]), 2)
+
+    def test_qcm_templates_are_complete_and_poem_grounded(self) -> None:
+        poem = make_poem()
+        self.assertEqual(len(QCM_PROMPT_TEMPLATES), 4)
+        self.assertEqual(len({template.prompt for template in QCM_PROMPT_TEMPLATES}), 4)
+        for template in QCM_PROMPT_TEMPLATES:
+            self.assertIn("{meter_name}", template.prompt)
+            self.assertIn("{couplet_count}", template.prompt)
+            self.assertIn("{poem}", template.prompt)
+            self.assertIn("QCM_QUESTION_CATEGORIES", template.prompt)
+            self.assertIn("QCM_REASONING_PROCESS", template.prompt)
+            self.assertIn("QCM_OUTPUT_CONTRACT", template.prompt)
+            messages = build_qcm_messages(
+                template=template,
+                meter_name=poem.meter_name,
+                couplet_count=poem.couplet_count,
+                poem=poem.poem_text,
+            )
+            self.assertEqual(
+                [message["role"] for message in messages],
+                [
+                    "system",
+                    "user",
+                    "assistant",
+                    "user",
+                    "assistant",
+                    "user",
+                    "assistant",
+                    "user",
+                ],
+            )
+            self.assertIn(poem.poem_text, messages[-1]["content"])
+            self.assertNotIn("{poem}", messages[-1]["content"])
+
+    def test_qcm_validation_prompt_checks_reasoning_quality(self) -> None:
+        poem = make_poem()
+        qcm = valid_qcm_value(poem)
+        messages = build_qcm_validation_messages(
+            poem=poem.poem_text,
+            candidate=qcm,
+        )
+        self.assertEqual([message["role"] for message in messages], ["system", "user"])
+        self.assertIn(poem.poem_text, messages[1]["content"])
+        self.assertIn(qcm["question"], messages[1]["content"])
+        self.assertIn("الاستدلال ليس عبارة عامة", messages[0]["content"])
 
     def test_validation_prompts_are_phase_specific(self) -> None:
         poem = make_poem()

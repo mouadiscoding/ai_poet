@@ -1,4 +1,4 @@
-# Building the Ashaar instruction-following SFT dataset
+# Building the Ashaar QCM SFT dataset
 
 ## Purpose
 
@@ -8,15 +8,17 @@ converts the poems in
 `data/ashaar_classic_moroccan.parquet` into supervised fine-tuning examples
 containing:
 
-1. A long Arabic instruction describing the poem to be written.
-2. A rendered Arabic editorial worklog with one structured block per couplet.
-3. The exact source poem as the final answer.
+1. The exact source poem.
+2. A poem-grounded multiple-choice question (QCM).
+3. Four plausible choices with exactly one correct answer.
+4. A demonstrative reasoning that explains why the correct answer is correct.
+5. The correct answer letter and its text.
 
-The generator uses the configured chat-completions endpoint and model to infer
-the subject, meaning progression, imagery, emotional atmosphere, diction, rhyme,
-and other constraints from each source poem. It does not ask Gemma to reproduce
-the final target. The Python code appends the original poem itself so that model
-copying errors cannot corrupt the SFT answer.
+The generator uses the configured chat-completions endpoint and model to
+produce a question that is answerable from the poem itself, that covers an
+aspect actually present in the text, and that offers four plausible choices
+with exactly one correct answer. The Python code assembles the final assistant
+message so that the exact source poem is always preserved.
 
 ## Source corpus findings
 
@@ -66,12 +68,10 @@ metadata:
 
 These labels identify only the base meter. They do not establish whether an
 individual poem uses a complete, catalectic, truncated, or other form. The
-prompts therefore name the base meter but explicitly forbid unsupported claims
-such as `تام` or `مجزوء`. They also avoid asserting a particular sequence of
-feet when that form is not verified.
-
-Records labeled `النثر` use a separate prompt route. Their instructions request
-internal cadence, parallel syntax, and sound patterning without claiming a
+prompts therefore name the base meter but do not force a meter question when
+the poem does not make the meter relevant. Records labeled `النثر` use a
+separate prompt route where the question must be answerable from the prose
+poem's internal cadence, parallel syntax, and imagery without claiming a
 classical Arabic meter.
 
 ## Deduplication and provenance
@@ -94,118 +94,149 @@ The pipeline chooses the unique majority label and marks the result as a
 metadata conflict. A tied conflict causes input loading to fail instead of
 silently choosing a label.
 
-## Few-shot template architecture
+## QCM template architecture
 
 ### Why concrete templates are used
 
-A single fixed surface instruction would make the SFT corpus formulaic. The
-implementation therefore provides six independently authored, complete Arabic
-templates. Each uses the same placeholders for meter, count, minimum length,
-form guidance, meter explanation, composition-plan heading, and source poem.
-Each also carries the full task, grounding rules, six poetic dimensions,
-required instruction layout, and output contract, while changing the workflow
-and structure used to express them.
+A single fixed surface prompt would make the SFT corpus formulaic. The
+implementation therefore provides four independently authored, complete Arabic
+QCM templates. Each uses the same placeholders for meter, couplet count, and
+source poem, and each injects the shared question-category list, reasoning
+process, and output contract. The templates vary the framing and the analytical
+entry point (comprehension, analysis, inference, formal/discursive) while every
+template requires the same core contract:
 
-`METER_DEFINITIONS` covers all 16 classical meters and the corpus's prose
-category. Each entry provides a definition, base full-verse weight, and an
-approximate long/short sound pattern. These data are injected into the selected
-template; prose receives an explicit non-applicable weight and internal-rhythm
-guidance. The base patterns follow Ahmad al-Hashimi's *Mizan al-Dhahab fi
-Sina'at Shi'r al-Arab*, while valid zihaf and `illa` variants remain allowed.
-
-The templates are:
-
-| Template ID | Primary emphasis |
-| --- | --- |
-| `prosody_rhyme` | Meter, rhyme, recitation, and sound |
-| `semantic_arc` | Meaning progression and poem-level unity |
-| `imagery_rhetoric` | Imagery, metaphor, comparison, and rhetorical relations |
-| `emotion_voice` | Emotional register, speaker, and changes in tone |
-| `occasion_addressee` | Occasion, addressee, and communicative purpose |
-| `diction_revision` | Lexicon, syntax, draft alternatives, and revision choices |
+- A single question whose answer is determinable from the poem.
+- Exactly four choices under A, B, C, D with exactly one correct answer.
+- A reasoning that follows the full conceptual path from the question to the
+  answer and that explains why each other choice is less suited.
 
 One template is selected uniformly without a seed at the start of each poem
 generation call and is retained for all repairs in that call. A later rerun of
 an unresolved poem may choose another template. Every template is eligible for
-prose; its form guidance replaces meter and scansion with internal rhythm,
-parallelism, sound, and observable rhyme.
+prose; the QCM question is always grounded in the poem's actual content, so no
+forced formal question is imposed when the poem does not support it.
 
-### Two separate few-shot stages
+### Question-category guidance
 
-Instruction generation uses the existing six-message chat sequence: a system
-policy, two source/JSON demonstrations, and the selected concrete template. Its
-assistant demonstrations and actual result now contain only:
+The shared category list is injected into every template:
 
-```json
-{"instruction": "A detailed Arabic instruction"}
+- The main idea or general theme of the poem.
+- The meaning of a passage, a verse, or a group of verses.
+- The poet's intention or the poem's aim.
+- The tone, emotional atmosphere, or attitude toward the addressee.
+- The emotions expressed.
+- The addressee or the person described, and relations among people mentioned.
+- A progression, sequence, opposition, contradiction, or contrast within the poem.
+- A poetic image, metaphor, comparison, or rhetorical device.
+- A lexical field, a choice of specific words, or the meaning of an expression
+  in context.
+- The occasion or context of the poem when it is identifiable in the text.
+- The structure or organisation of the discourse.
+- The rhyme or formal elements when they are genuinely relevant.
+- The meter when the information can be deduced or verified from the available
+  data.
+- The relation between different passages of the poem.
+- A reasonable inference the reader can make from the text.
+
+The model is explicitly told to pick the most pertinent category for the
+concrete poem and never to force a category that the text does not support.
+This is what makes the resulting questions varied: the diversity comes from the
+poem's actual content rather than from a fixed question type.
+
+### Reasoning process
+
+Every template injects the same reasoning process to guarantee a demonstrative,
+poem-specific explanation rather than a generic one-liner:
+
+```
+Question
+↓
+Understand what the question asks
+↓
+Analyze the poem only from the angle relevant to that question
+↓
+Identify the elements of the poem that allow an answer
+↓
+Compare those elements to choices A/B/C/D
+↓
+Determine the choice that actually matches the text
+↓
+Explain why that choice is correct
+↓
+When relevant, explain why the other choices are incorrect or less suited
 ```
 
-Editorial-work generation is a separate conversation after the instruction has
-passed validation. It uses a multi-verse metered demonstration or a multi-unit
-prose demonstration and requests structured, source-linked work for at most
-three target couplets. This separation prevents the model from narrating how it
-created the `instruction` when it should be acting as the poet.
+The reasoning must therefore be natural, logical, based on the poem, specific
+to the question, specific to the proposed choices, and sufficiently
+explanatory to demonstrate why the correct answer is correct.
 
-### Actual instruction requirements
+### Few-shot demonstrations
 
-The system and final user messages tell Gemma that every generated instruction
-must use these sections in order:
+The QCM build uses a chat sequence of `system` plus three `user`/`assistant`
+demonstrations followed by the selected concrete template. The three examples
+show different types of question to encourage variety:
 
-1. `الموضوع العام:`
-2. `الجو العاطفي المطلوب:`
-3. `ألفاظ وصور يُستحسن استعمالها أو الدوران حولها:`
-4. `القافية:`
-5. `شرح البحر المطلوب:` including `وزنه في كل بيت كامل:`
-6. `الصورة الصوتية التقريبية:`
-7. A meter-specific practical composition plan; prose receives a prose plan.
+- A metered (`الخفيف`) example with a main-idea question.
+- A metered (`الرمل`) example with a contrast/contradiction question.
+- A prose (`النثر`) example with an image-meaning question.
 
-Across those sections it must cover:
+Each example's reasoning follows the full conceptual path and references
+specific words, verses, and choices.
 
-- The exact number of couplets, written in digits.
-- The base meter or an explicit prose-poetry requirement.
-- The main subject and semantic progression.
-- Secondary meanings that should appear.
-- Emotional atmosphere and the speaker's voice.
-- Imagery and rhetorical devices supported by the source.
-- Classical Arabic diction and syntactic expectations.
-- Rhyme behavior that can be inferred from the source.
-- General recitation and prosodic guidance where applicable.
-- The expected response structure.
+## Output contract
 
-The instruction may mention isolated words useful for a rhyme or image, but it
-must not copy a complete source hemistich. It must not name the original poet,
-title, or URL.
+Every QCM generation must produce a JSON object with exactly these keys:
 
-## Editorial work and exact final targets
+```json
+{
+  "question": "...",
+  "choices": {"A": "...", "B": "...", "C": "...", "D": "..."},
+  "reasoning": "...",
+  "correct_answer": "B"
+}
+```
 
-The second stage returns an `overview` for the first chunk and one
-`verse_reasoning` object per couplet. Every object contains the intended
-meaning, its link to the preceding context, imagery and diction, a genuine
-first draft, a specific reason for rejecting that draft, the exact accepted
-couplet, separate sound checks for both hemistichs, and a rhyme check.
+- `question`: the question text.
+- `choices`: exactly four non-empty strings under A, B, C, D.
+- `reasoning`: the demonstrative reasoning described above.
+- `correct_answer`: exactly one of A, B, C, D.
 
-This is an explicit synthetic editorial reconstruction. Because the pipeline
-starts from an existing poem, it is not represented as access to the historical
-poet's private thoughts.
+The model must not mention that it is analyzing a reference text, and it must
+not talk about the template, fields, or instructions.
 
-The renderer preserves accepted couplets quoted inside these work blocks. It
-removes only a leading or explicitly labeled accidental full-poem dump and
-anything after an accidental result marker, then appends exactly one canonical
-marker and the exact source poem. The endpoint therefore cannot rewrite, normalize,
-re-diacritize, or hallucinate the final target.
+## Sequence of generation
+
+For a normal (non-oversized) poem, `generate_one`:
+
+1. Selects one of the four QCM templates uniformly at random.
+2. Builds the `system` + three few-shot pairs + final user message containing
+   the poem.
+3. Sends the conversation to the endpoint and parses the QCM JSON.
+4. Runs deterministic validation (`extract_qcm` + `qcm_contract_errors`).
+5. Sends the QCM to a Gemma semantic judge at temperature zero, expecting
+   `{"passed": true, "errors": []}`.
+6. Repairs with phase-specific feedback until the QCM passes or the repair
+   budget is exhausted.
+7. Assembles the final record with the exact source poem, the question, the
+   choices, the reasoning, the correct answer, and the OpenAI-style `messages`.
+
+The repair loop always reuses the original base messages and appends the
+rejected assistant content plus actionable repair feedback.
 
 ## Oversized-poem processing
 
 The direct source limit defaults to 24,000 characters. A longer poem is split
 at complete-couplet boundaries into chunks of at most 12,000 characters.
 
-For each source-size chunk, the endpoint receives a compact-analysis request.
-The ordered summaries are used only by the global instruction stage. Editorial
-work is always generated separately in groups of at most three exact couplets,
-regardless of whether the source exceeded the direct-source limit.
+For each chunk, the endpoint receives a compact-analysis request. The ordered
+summaries from all chunks are then combined, and the QCM is built from the
+poem as a whole, not from a single chunk. The question therefore reflects the
+entire poem, which matches the user requirement that a global QCM be built from
+the full text when the poem is too long to send directly.
 
-The result remains one instruction/answer pair for the complete poem, and the
-complete original poem is still appended to the response. Such rows receive:
+The final SFT record still includes the complete source poem and marks such
+rows with:
 
 ```text
 oversized_for_sft = true
@@ -227,9 +258,6 @@ TLS certificate verification is enabled by default. `--insecure` explicitly
 creates an unverified TLS context and is equivalent to `curl -k`. It should be
 used only for a trusted internal endpoint.
 
-Any credential pasted into chat, source code, shell history, or logs must be
-revoked and replaced before generation.
-
 ### Full generation tracing
 
 Pass `--trace` to print complete, non-interleaved audit blocks to the terminal
@@ -241,30 +269,21 @@ the full corpus consumes substantial terminal and disk space.
 The append-only trace assigns a new `run_id` to each invocation and records:
 
 - Run settings, source fingerprint, checkpoint reuse count, template version,
-  the six concrete prompts, and the shared focus contract.
+  the four QCM concrete prompts, and the shared reasoning process.
 - Per-poem provenance, all eligible template IDs, the fresh random selection,
   and why the selected template is retained through repairs.
-- Every request kind: oversized-poem analysis, instruction generation and
-  repair, verse-chunk generation and repair, and both quality-review phases.
+- Every request kind: oversized-poem analysis, QCM generation and repair, and
+  the QCM quality review.
 - The full OpenAI-compatible request body, including every system, few-shot,
   and final user message, seed, and decoding settings.
 - The complete decoded API response payload. This retains endpoint-provided
   fields such as `message.reasoning_content`, `finish_reason`, and `usage` when
   the server supplies them.
 - Network-attempt counts, retry errors, and elapsed time.
-- Raw generation content, parsed structures, deterministic contract errors,
+- Raw generation content, parsed QCM structures, deterministic contract errors,
   raw and parsed Gemma verdicts, and whether a phase-specific repair is needed.
-- Parsed instruction, structured verse-work blocks, rendered editorial text,
-  and the final assistant response after the exact source poem is appended.
-- Final success, failure, template, and validation-status counts.
-
-The request body is the complete prompt representation available to this
-client. Any later conversion of those chat messages into Gemma's tokenized chat
-template happens inside the serving endpoint and cannot be observed here.
-
-The verse-work fields are ordinary structured response content, not private
-server reasoning. Gemma also does not generate the consolidated final poem;
-the program appends the trusted source poem after rendering the validated work.
+- The parsed QCM, the final assistant response (including the exact source
+  poem), and the final success/failure and validation-status counts.
 
 The request headers are never included. Before an event is printed or written,
 the configured API key is recursively replaced with `[REDACTED]` anywhere it
@@ -272,33 +291,46 @@ might appear in request, response, or error text.
 
 ## Response validation and repair
 
-Python performs deterministic validation before either semantic review. For
-instructions it checks the sole-field schema, minimum length, exact heading
-names and order, numeric count, meter name, and absence of complete source
-hemistichs. Missing-heading repair feedback names every required heading that
-was absent. For every
-reasoning chunk it checks the exact schema and block count, contiguous indices,
-non-empty fields, exact source equality of every `revised_draft`, a distinct
-`first_draft`, prospective rather than retrospective wording before that draft,
-and absence of dataset-generation metatext. The semantic review then checks
-that the stated defect really belongs to the first draft and that the proposed
-change leads coherently to the accepted verse.
+### Deterministic validation
 
-Gemma then reviews the instruction or reasoning chunk at temperature zero for
-semantic and rhetorical quality. The instruction judge accepts the fixed seven
-heading contract and may not invent additional headings. The reasoning judge
-does not receive the two scansion fields, so exact scansion is not a same-model
-hard rejection gate; Python still requires those fields to be present and
-substantive. Each review returns exactly:
+Python validates the QCM structurally before the semantic Gemma judge is
+consulted:
+
+- `extract_qcm` requires exactly the keys `question`, `choices`, `reasoning`,
+  and `correct_answer`; non-empty strings; `choices` with exactly A/B/C/D keys;
+  and `correct_answer` in {A, B, C, D}.
+- `qcm_contract_errors` additionally checks:
+  - a minimum question length (20 characters);
+  - a minimum reasoning length (150 characters);
+  - a minimum choice length (15 characters per choice);
+  - that no other choice duplicates the correct answer's text;
+  - that the reasoning references at least one choice letter (أ/ب/ج/د or
+    A/B/C/D);
+  - that the reasoning is not a generic one-liner such as «الإجابة B صحيحة
+    لأن النص يتحدث عن ذلك»;
+  - that the reasoning does not expose generation metatext.
+
+### Semantic validation
+
+Gemma then reviews the QCM at temperature zero. The judge verifies that:
+
+- the question is related to and grounded in the poem, and the answer is
+  determinable from the text;
+- the four choices are plausible on the surface but only one is correct or most
+  accurate;
+- the reasoning is natural, logical, based on the poem, specific to the
+  question and to the choices, and demonstrates why the correct answer is
+  correct and why the others are less suited;
+- the reasoning is not a generic sentence.
+
+The judge returns exactly:
 
 ```json
 {"passed": true, "errors": []}
 ```
 
-Instruction failures repair only the instruction before verse generation
-begins. A failed reasoning chunk is repaired independently, so accepted chunks
-are not regenerated. Malformed verdicts fail safely. Network retries remain
-separate from content repairs.
+QCM failures repair only the QCM. Malformed verdicts fail safely. Network
+retries remain separate from content repairs.
 
 ## Checkpoint and resume semantics
 
@@ -316,9 +348,9 @@ or:
 ```
 
 On restart, a successful record is reused only when its `template_version` is
-7. Legacy successes without that version are regenerated and remain intact in
-the append-only log. Failed or missing IDs are also submitted again. A later
-success supersedes an earlier failure.
+8 (`QCM_TEMPLATE_VERSION`). Legacy successes without that version are
+regenerated and remain intact in the append-only log. Failed or missing IDs are
+also submitted again. A later success supersedes an earlier failure.
 
 Checkpoint events are written by the main thread after each concurrent task
 finishes, so individual JSON lines are not interleaved. Each successful SFT
@@ -365,27 +397,50 @@ The pipeline writes the same logical records to `ashaar_sft.jsonl` and
 | `meter_id` | Original numeric base-meter class |
 | `meter_name` | Decoded Arabic base-meter name |
 | `couplet_count` | Number of hemistich pairs |
-| `template_id` | Selected concrete prompt template |
-| `template_version` | Prompt and validation contract version; currently `7` |
-| `instruction` | Generated Arabic user instruction |
-| `response` | Generated reasoning plus exact source poem |
+| `poem` | The exact source poem text |
+| `template_id` | Selected concrete QCM prompt template |
+| `template_version` | QCM prompt and validation contract version; currently `8` |
+| `question` | Generated Arabic QCM question |
+| `choices` | Four-choice object keyed by A, B, C, D |
+| `reasoning` | Demonstrative reasoning tied to the question and choices |
+| `correct_answer` | Letter (A/B/C/D) of the correct choice |
+| `correct_answer_text` | Text of the correct choice |
+| `response` | The composed assistant response |
 | `messages` | Two-message chat SFT representation |
 | `sft_split` | Stable train, validation, or test assignment |
 | `oversized_for_sft` | Whether chunk analysis was required |
 | `metadata_conflict` | Whether duplicate sources disagreed on meter |
-| `generation_attempts` | Total instruction and reasoning generation attempts |
-| `instruction_generation_attempts` | Instruction generation attempts including repairs |
-| `reasoning_generation_attempts` | Sum of generation attempts across reasoning chunks |
-| `reasoning_chunk_count` | Number of bounded verse-work chunks |
-| `validation_status` | Whether both phases passed directly or after any repair |
+| `generation_attempts` | Total QCM generation attempts including repairs |
+| `validation_status` | Whether the QCM passed directly or after repair |
 
 `messages` contains:
 
 ```json
 [
-  {"role": "user", "content": "<instruction>"},
-  {"role": "assistant", "content": "<reasoning and exact poem>"}
+  {"role": "user", "content": "<poem>"},
+  {"role": "assistant", "content": "<response>"}
 ]
+```
+
+The composed assistant response has this exact structure:
+
+```text
+<القصيدة الأصلية>
+
+السؤال:
+<السؤال>
+
+الخيارات:
+A. <الخيار أ>
+B. <الخيار ب>
+C. <الخيار ج>
+D. <الخيار د>
+
+الاستدلال:
+<الاستدلال>
+
+الإجابة الصحيحة: <الحرف>
+<نص الإجابة الصحيحة>
 ```
 
 The output directory also contains:
@@ -460,17 +515,18 @@ uv run python -m unittest discover -s tests -v
 
 It covers:
 
-- Rendering and fresh random selection of all six concrete templates.
-- Comprehensive metered and prose few-shot examples.
+- Rendering and fresh random selection of all four QCM templates.
+- Comprehensive metered and prose QCM few-shot examples.
 - Meter decoding and invalid IDs.
 - Exact hemistich pairing.
 - Stable hashes and splits.
 - Deduplication and majority conflict resolution.
 - JSON and fenced-JSON extraction.
-- Strict Gemma verdict parsing, rejection feedback, and repair.
-- Exact source-poem preservation.
-- Oversized-poem summaries and synthesis.
-- Template-version-aware checkpoint reuse.
+- Strict Gemma verdict parsing, rejection feedback, and QCM repair.
+- Deterministic QCM structural validation and contract checks.
+- Exact source-poem preservation in the composed response.
+- Oversized-poem summaries and global-QCM synthesis.
+- QCM-template-version-aware checkpoint reuse.
 - JSONL and Parquet round trips.
 
 Before a full production run is accepted, verify that:
@@ -486,23 +542,17 @@ Before a full production run is accepted, verify that:
 ## Known limitations
 
 - The base-meter label does not prove a specific metrical form.
-- Semantic and rhetorical descriptions and their quality verdicts come from
-  the same Gemma model, so correlated mistakes remain possible.
-- The pipeline does not certify exact Arabic scansion. The generated scansion
-  fields still need expert or purpose-built prosody review, and semantic Gemma
-  validation adds a request for every parseable instruction or reasoning chunk
-  attempt.
-- Chunk summaries can lose global detail in instructions for extremely long
-  poems, although verse-work generation still receives each exact couplet.
-- Long reasoning increases storage and training-token cost substantially.
-- Keeping all oversized poems in the master data does not make them trainable
-  by every target model.
+- Question quality and the semantic quality verdict come from the same Gemma
+  model, so correlated mistakes remain possible.
+- Chunk summaries can lose global detail for QCM questions on extremely long
+  poems, although the summaries cover all chunks so that the question still
+  reflects the poem as a whole.
 - The source dataset's title and theme metadata are too sparse to serve as the
   primary semantic supervision.
-
-These limitations make manual review of a stratified sample important,
-especially across rare meters, prose, repaired generations, metadata conflicts,
-and oversized poems.
+- Since the QCM is generated by the same model that validates it, a correlated
+  misunderstanding of the poem could pass both stages. Manual review of a
+  stratified sample remains important, especially across rare meters, prose,
+  repaired generations, metadata conflicts, and oversized poems.
 
 ## Licensing and distribution
 

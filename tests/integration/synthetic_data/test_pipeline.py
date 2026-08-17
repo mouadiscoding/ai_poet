@@ -1,33 +1,36 @@
 from __future__ import annotations
 
-from contextlib import redirect_stdout
 import io
 import json
 import unittest
+from contextlib import redirect_stdout
 from unittest.mock import patch
 
 import pyarrow.parquet as pq
-
 from ai_poet.synthetic_data.checkpoint import load_checkpoint
 from ai_poet.synthetic_data.client import GemmaClient
 from ai_poet.synthetic_data.config import RunSettings
 from ai_poet.synthetic_data.errors import GenerationError
 from ai_poet.synthetic_data.generation import generate_one
 from ai_poet.synthetic_data.outputs import append_jsonl, write_outputs
+from ai_poet.synthetic_data.prompts.qcm_templates import (
+    QCM_PROMPT_TEMPLATES,
+    QCM_TEMPLATE_VERSION,
+)
 from ai_poet.synthetic_data.runner import run
 from ai_poet.synthetic_data.tracing import GenerationTracer
-from ai_poet.synthetic_data.prompts.templates import PROMPT_TEMPLATES, TEMPLATE_VERSION
+
 from tests.synthetic_data_helpers import (
     TEST_TMP,
     QueueClient,
     make_poem,
     remove_test_files,
     settings,
-    valid_instruction_value,
-    valid_pipeline_outputs,
-    valid_reasoning_value,
+    valid_qcm_pipeline_outputs,
+    valid_qcm_value,
     valid_verdict,
 )
+
 
 class PipelineTests(unittest.TestCase):
     def test_api_trace_contains_full_exchange_and_redacts_secret(self) -> None:
@@ -64,20 +67,22 @@ class PipelineTests(unittest.TestCase):
         tracer = GenerationTracer(path, secrets=("secret",))
         client = GemmaClient(settings(), tracer=tracer)
         stdout = io.StringIO()
-        with patch(
-            "ai_poet.synthetic_data.client.urlopen", return_value=FakeResponse()
+        with (
+            patch("ai_poet.synthetic_data.client.urlopen", return_value=FakeResponse()),
+            redirect_stdout(stdout),
         ):
-            with redirect_stdout(stdout):
-                result = client.chat(
-                    [{"role": "user", "content": "prompt containing secret"}],
-                    seed=42,
-                    trace_context={"sample_id": "abc", "request_kind": "initial"},
-                )
+            result = client.chat(
+                [{"role": "user", "content": "prompt containing secret"}],
+                seed=42,
+                trace_context={"sample_id": "abc", "request_kind": "initial"},
+            )
 
         self.assertEqual(result, "raw answer")
         event = json.loads(path.read_text("utf-8"))
-        self.assertEqual(event["request"]["messages"][0]["content"],
-                         "prompt containing [REDACTED]")
+        self.assertEqual(
+            event["request"]["messages"][0]["content"],
+            "prompt containing [REDACTED]",
+        )
         self.assertEqual(
             event["response"]["choices"][0]["message"]["reasoning_content"],
             "server reasoning",
@@ -88,14 +93,13 @@ class PipelineTests(unittest.TestCase):
 
     def test_generation_trace_explains_template_and_records_final_output(self) -> None:
         poem = make_poem()
-        instruction_value = valid_instruction_value(poem)
-        reasoning_value = valid_reasoning_value(poem)
+        qcm_value = valid_qcm_value(poem)
         TEST_TMP.mkdir(exist_ok=True)
         path = TEST_TMP / "generation_trace.jsonl"
         remove_test_files(path.name)
         self.addCleanup(remove_test_files, path.name)
         tracer = GenerationTracer(path, secrets=("secret",))
-        client = QueueClient(valid_pipeline_outputs(poem), tracer=tracer)
+        client = QueueClient(valid_qcm_pipeline_outputs(poem), tracer=tracer)
 
         with redirect_stdout(io.StringIO()):
             record = generate_one(poem, client, settings())
@@ -104,46 +108,39 @@ class PipelineTests(unittest.TestCase):
         by_type = {event["event"]: event for event in events}
         self.assertIn("why_used", by_type["template_selection"])
         self.assertEqual(
-            by_type["instruction_generation_result"]["raw_model_content"],
-            json.dumps(instruction_value, ensure_ascii=False),
+            by_type["qcm_generation_result"]["raw_model_content"],
+            json.dumps(qcm_value, ensure_ascii=False),
         )
-        self.assertEqual(
-            by_type["reasoning_chunk_generation_result"]["parsed_output"],
-            reasoning_value,
-        )
-        self.assertTrue(by_type["instruction_validation_result"]["passed"])
-        self.assertTrue(by_type["reasoning_chunk_validation_result"]["passed"])
+        self.assertEqual(by_type["qcm_generation_result"]["parsed_qcm"], qcm_value)
+        self.assertTrue(by_type["qcm_validation_result"]["passed"])
         self.assertEqual(
             by_type["final_output"]["final_assistant_response"], record["response"]
         )
+        self.assertIn("parsed_qcm", by_type["final_output"])
         self.assertNotIn("raw_model_content", record)
         self.assertNotIn("generation_trace", record)
 
     def test_generate_one_repairs_invalid_json(self) -> None:
         poem = make_poem()
-        valid = json.dumps(valid_instruction_value(poem), ensure_ascii=False)
+        valid = json.dumps(valid_qcm_value(poem), ensure_ascii=False)
         client = QueueClient(
             [
                 "{}",
                 valid,
                 json.dumps(valid_verdict(), ensure_ascii=False),
-                json.dumps(valid_reasoning_value(poem), ensure_ascii=False),
-                json.dumps(valid_verdict(), ensure_ascii=False),
             ]
         )
         record = generate_one(poem, client, settings())
-        self.assertEqual(record["generation_attempts"], 3)
-        self.assertEqual(record["instruction_generation_attempts"], 2)
-        self.assertEqual(record["reasoning_generation_attempts"], 1)
+        self.assertEqual(record["generation_attempts"], 2)
         self.assertEqual(record["validation_status"], "passed_after_repair")
-        self.assertEqual(len(client.calls), 5)
+        self.assertEqual(len(client.calls), 3)
         self.assertEqual(record["messages"][1]["content"], record["response"])
 
-    def test_gemma_instruction_rejection_repairs_instruction_before_reasoning(self) -> None:
+    def test_gemma_qcm_rejection_repairs_qcm_before_finalizing(self) -> None:
         poem = make_poem()
-        candidate = json.dumps(valid_instruction_value(poem), ensure_ascii=False)
+        candidate = json.dumps(valid_qcm_value(poem), ensure_ascii=False)
         rejection = json.dumps(
-            {"passed": False, "errors": ["لم يذكر المخاطَب بوضوح"]},
+            {"passed": False, "errors": ["الاستدلال عام ولا يبيّن سبب الاختيار"]},
             ensure_ascii=False,
         )
         client = QueueClient(
@@ -151,60 +148,37 @@ class PipelineTests(unittest.TestCase):
                 candidate,
                 rejection,
                 candidate,
-                json.dumps(valid_verdict(), ensure_ascii=False),
-                json.dumps(valid_reasoning_value(poem), ensure_ascii=False),
                 json.dumps(valid_verdict(), ensure_ascii=False),
             ]
         )
         with patch(
             "ai_poet.synthetic_data.generation.random.choice",
-            return_value=PROMPT_TEMPLATES[2],
+            return_value=QCM_PROMPT_TEMPLATES[2],
         ) as choice:
             record = generate_one(poem, client, settings())
 
-        self.assertEqual(record["generation_attempts"], 3)
-        self.assertEqual(record["template_id"], "imagery_rhetoric")
-        self.assertIn("لم يذكر المخاطَب بوضوح", client.calls[2][-1]["content"])
-        choice.assert_called_once_with(PROMPT_TEMPLATES)
-
-    def test_gemma_reasoning_rejection_repairs_only_that_chunk(self) -> None:
-        poem = make_poem()
-        reasoning = json.dumps(valid_reasoning_value(poem), ensure_ascii=False)
-        rejection = json.dumps(
-            {"passed": False, "errors": ["سبب مراجعة المسودة عام وغير ملموس"]},
-            ensure_ascii=False,
+        self.assertEqual(record["generation_attempts"], 2)
+        self.assertEqual(record["template_id"], "qcm_inference")
+        self.assertIn(
+            "الاستدلال عام ولا يبيّن سبب الاختيار", client.calls[2][-1]["content"]
         )
-        client = QueueClient(
-            [
-                json.dumps(valid_instruction_value(poem), ensure_ascii=False),
-                json.dumps(valid_verdict(), ensure_ascii=False),
-                reasoning,
-                rejection,
-                reasoning,
-                json.dumps(valid_verdict(), ensure_ascii=False),
-            ]
-        )
-        record = generate_one(poem, client, settings())
-        self.assertEqual(record["instruction_generation_attempts"], 1)
-        self.assertEqual(record["reasoning_generation_attempts"], 2)
-        self.assertIn("سبب مراجعة المسودة عام", client.calls[4][-1]["content"])
+        self.assertEqual(record["validation_status"], "passed_after_repair")
+        choice.assert_called_once_with(QCM_PROMPT_TEMPLATES)
 
     def test_malformed_gemma_verdict_is_never_exported(self) -> None:
         poem = make_poem()
-        candidate = json.dumps(valid_instruction_value(poem), ensure_ascii=False)
+        candidate = json.dumps(valid_qcm_value(poem), ensure_ascii=False)
         client = QueueClient([candidate, "{}"])
         with self.assertRaises(GenerationError):
             generate_one(poem, client, settings())
 
-    def test_oversized_poem_is_summarized_then_generated(self) -> None:
+    def test_oversized_poem_is_summarized_then_generated_as_global_qcm(self) -> None:
         poem = make_poem(verses=("أ" * 30, "ب" * 30, "ج" * 30, "د" * 30))
         client = QueueClient(
             [
                 "ملخص عربي واضح",
                 "ملخص عربي ثان",
-                json.dumps(valid_instruction_value(poem), ensure_ascii=False),
-                json.dumps(valid_verdict(), ensure_ascii=False),
-                json.dumps(valid_reasoning_value(poem), ensure_ascii=False),
+                json.dumps(valid_qcm_value(poem), ensure_ascii=False),
                 json.dumps(valid_verdict(), ensure_ascii=False),
             ]
         )
@@ -214,52 +188,17 @@ class PipelineTests(unittest.TestCase):
             settings(max_source_chars=20, chunk_chars=70),
         )
         self.assertTrue(record["oversized_for_sft"])
-        self.assertEqual(len(client.calls), 6)
+        self.assertEqual(len(client.calls), 4)
         self.assertIn("ملخص المقطع", client.calls[2][-1]["content"])
-        self.assertIn("ملخص المقطع", client.calls[3][-1]["content"])
-        for couplet in poem.poem_text.splitlines():
-            self.assertIn(couplet, client.calls[4][-1]["content"])
-
-    def test_long_reasoning_is_generated_in_ordered_three_couplet_chunks(self) -> None:
-        poem = make_poem(
-            verses=tuple(
-                part
-                for index in range(1, 11)
-                for part in (f"صدر البيت {index}", f"عجز البيت {index}")
-            )
-        )
-        outputs = [
-            json.dumps(valid_instruction_value(poem), ensure_ascii=False),
-            json.dumps(valid_verdict(), ensure_ascii=False),
-        ]
-        for start_offset, chunk_size in ((0, 3), (3, 3), (6, 3), (9, 1)):
-            outputs.extend(
-                [
-                    json.dumps(
-                        valid_reasoning_value(
-                            poem,
-                            start_offset=start_offset,
-                            chunk_size=chunk_size,
-                        ),
-                        ensure_ascii=False,
-                    ),
-                    json.dumps(valid_verdict(), ensure_ascii=False),
-                ]
-            )
-
-        client = QueueClient(outputs)
-        record = generate_one(poem, client, settings())
-
-        self.assertEqual(record["reasoning_chunk_count"], 4)
-        self.assertEqual(record["reasoning_generation_attempts"], 4)
-        self.assertEqual(record["generation_attempts"], 5)
-        for index in range(1, 11):
-            self.assertEqual(record["response"].count(f"البيت {index}:"), 1)
-        self.assertTrue(record["response"].endswith(poem.poem_text))
+        self.assertIn("القصيدة كلها", client.calls[2][-1]["content"])
+        self.assertIn("المقطع 1 من 2:", client.calls[0][-1]["content"])
+        self.assertIn("المقطع 2 من 2:", client.calls[1][-1]["content"])
+        self.assertIn("ملخص المقطع 1", client.calls[2][-1]["content"])
+        self.assertIn("ملخص المقطع 2", client.calls[2][-1]["content"])
 
     def test_checkpoint_and_exports_round_trip(self) -> None:
         poem = make_poem()
-        client = QueueClient(valid_pipeline_outputs(poem))
+        client = QueueClient(valid_qcm_pipeline_outputs(poem))
         record = generate_one(poem, client, settings())
         generated_files = (
             "checkpoint.jsonl",
@@ -293,8 +232,8 @@ class PipelineTests(unittest.TestCase):
             manifest = json.loads((root / "manifest.json").read_text("utf-8"))
             self.assertTrue(manifest["complete"])
             self.assertFalse(manifest["trace"]["enabled"])
-            self.assertEqual(manifest["template_version"], TEMPLATE_VERSION)
-            self.assertEqual(record["template_version"], TEMPLATE_VERSION)
+            self.assertEqual(manifest["template_version"], QCM_TEMPLATE_VERSION)
+            self.assertEqual(record["template_version"], QCM_TEMPLATE_VERSION)
         finally:
             remove_test_files(*generated_files)
 
@@ -319,7 +258,7 @@ class PipelineTests(unittest.TestCase):
         poem = make_poem()
         record = generate_one(
             poem,
-            QueueClient(valid_pipeline_outputs(poem)),
+            QueueClient(valid_qcm_pipeline_outputs(poem)),
             settings(),
         )
         generated_files = ("generation_checkpoint.jsonl", "ashaar_sft.jsonl")
@@ -340,7 +279,10 @@ class PipelineTests(unittest.TestCase):
 
         with (
             patch("ai_poet.synthetic_data.runner.load_poems", return_value=[poem]),
-            patch("ai_poet.synthetic_data.runner.file_sha256", return_value="source-digest"),
+            patch(
+                "ai_poet.synthetic_data.runner.file_sha256",
+                return_value="source-digest",
+            ),
             patch("ai_poet.synthetic_data.runner.generate_one", return_value=record),
             patch(
                 "ai_poet.synthetic_data.runner.write_outputs",
@@ -352,8 +294,11 @@ class PipelineTests(unittest.TestCase):
 
     def test_run_regenerates_legacy_checkpoint_success(self) -> None:
         poem = make_poem()
-        legacy_record = {"sample_id": poem.sample_id, "template_version": 1}
-        current_record = {"sample_id": poem.sample_id, "template_version": TEMPLATE_VERSION}
+        legacy_record = {"sample_id": poem.sample_id, "template_version": 7}
+        current_record = {
+            "sample_id": poem.sample_id,
+            "template_version": QCM_TEMPLATE_VERSION,
+        }
         generated_files = ("generation_checkpoint.jsonl", "ashaar_sft.jsonl")
         remove_test_files(*generated_files)
         self.addCleanup(remove_test_files, *generated_files)

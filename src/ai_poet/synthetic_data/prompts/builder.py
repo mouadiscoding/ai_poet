@@ -3,14 +3,22 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Sequence
+from collections.abc import Sequence
+from typing import Any
 
 from .examples import (
-    FewShot,
     METERED_FEW_SHOTS,
     METERED_REASONING_FEW_SHOT,
     PROSE_FEW_SHOTS,
     PROSE_REASONING_FEW_SHOT,
+    FewShot,
+)
+from .qcm_examples import QCM_FEW_SHOTS, QcmFewShot
+from .qcm_templates import (
+    QCM_OUTPUT_CONTRACT,
+    QCM_QUESTION_CATEGORIES,
+    QCM_REASONING_PROCESS,
+    QcmPromptTemplate,
 )
 from .templates import (
     ALL_FOCUS_REQUIREMENTS,
@@ -18,7 +26,6 @@ from .templates import (
     meter_explanation,
     plan_heading,
 )
-
 
 SYSTEM_PROMPT = """أنت تبني تعليمات تدريب إشرافي لشاعر عربي. مهمتك عكسية ومحددة: تتلقى قصيدة مستهدفة، ثم تكتب instruction مفصلة كان يمكن أن تؤدي إليها. لا تكتب تعليلًا ولا تشرح كيف حللت المرجع. التزم بالحقائق الظاهرة ولا تنسب النص إلى شاعره ولا تذكر عنوانه أو رابطه. لا تنسخ شطرًا كاملًا داخل التعليمات، ويجوز ذكر ألفاظ مفردة تخدم القافية أو الصورة.
 
@@ -121,6 +128,96 @@ def build_messages(
         }
     )
     return messages
+
+
+def _example_qcm_user(example: QcmFewShot) -> str:
+    """Render the user half of a QCM few-shot demonstration."""
+    return (
+        "ضع سؤال اختيار من متعدد عن هذه القصيدة.\n"
+        f"البحر الأساس: {example.meter_name}\n"
+        f"عدد الأبيات أو الوحدات: {example.couplet_count}\n"
+        "القصيدة:\n"
+        f"{example.poem}"
+    )
+
+
+def _example_qcm_assistant(example: QcmFewShot) -> str:
+    """Serialize the assistant half of a QCM demonstration."""
+    return json.dumps(example.qcm, ensure_ascii=False)
+
+
+def build_qcm_messages(
+    *,
+    template: QcmPromptTemplate,
+    meter_name: str,
+    couplet_count: int,
+    poem: str,
+) -> list[dict[str, str]]:
+    """Build the complete QCM-generation conversation for one poem."""
+    messages: list[dict[str, str]] = [
+        {
+            "role": "system",
+            "content": (
+                "أنت تضع سؤال اختيار من متعدد (QCM) عن قصيدة عربية. "
+                "السؤال يجب أن يكون قائمًا على القصيدة نفسها وقابلًا للإجابة "
+                "بالاعتماد عليها.\n"
+                f"{QCM_QUESTION_CATEGORIES}\n\n"
+                f"{QCM_REASONING_PROCESS}\n\n"
+                f"{QCM_OUTPUT_CONTRACT}"
+            ),
+        }
+    ]
+    for example in QCM_FEW_SHOTS:
+        messages.extend(
+            [
+                {"role": "user", "content": _example_qcm_user(example)},
+                {"role": "assistant", "content": _example_qcm_assistant(example)},
+            ]
+        )
+
+    messages.append(
+        {
+            "role": "user",
+            "content": template.prompt.format(
+                meter_name=meter_name,
+                couplet_count=couplet_count,
+                poem=poem,
+                QCM_QUESTION_CATEGORIES=QCM_QUESTION_CATEGORIES,
+                QCM_REASONING_PROCESS=QCM_REASONING_PROCESS,
+                QCM_OUTPUT_CONTRACT=QCM_OUTPUT_CONTRACT,
+            ),
+        }
+    )
+    return messages
+
+
+def build_qcm_validation_messages(
+    *,
+    poem: str,
+    candidate: dict[str, object],
+) -> list[dict[str, str]]:
+    """Build the semantic-quality validation request for one QCM."""
+    criteria = """افحص دلاليًا سؤال الاختيار من متعدد الآتي:
+- السؤال مرتبط بالقصة ومستند إليها، والإجابة قابلة للاستنتاج من النص.
+- الخيارات الأربعة محتملة الظاهر لكن واحدًا منها فقط صحيح أو الأدق.
+- الاستدلال طبيعي ومنطقي ومبني على القصيدة، ومخصص للسؤال وللخيارات،
+  ويبيّن لماذا الخيار الصحيح صحيح ولماذا الخيارات الأخرى غير صحيحة أو أقل مناسبة.
+- الاستدلال ليس عبارة عامة كـ «الإجابة B صحيحة لأن النص يتحدث عن ذلك».
+
+أعد كائن JSON فقط بهذه البنية الدقيقة:
+{"passed":true,"errors":[]}
+
+ضع passed=false وأسبابًا عربية محددة في errors عند مخالفة دلالية ظاهرة ضمن هذا النطاق فقط."""
+    return [
+        {"role": "system", "content": criteria},
+        {
+            "role": "user",
+            "content": (
+                f"<poem>\n{poem}\n</poem>\n\n<candidate>\n"
+                f"{json.dumps(candidate, ensure_ascii=False)}\n</candidate>"
+            ),
+        },
+    ]
 
 
 def build_reasoning_messages(
@@ -253,11 +350,7 @@ def build_reasoning_validation_messages(
     omitted_fields = {"first_hemistich_scansion", "second_hemistich_scansion"}
     semantic_candidate = dict(candidate)
     semantic_candidate["verse_reasoning"] = [
-        {
-            field: value
-            for field, value in block.items()
-            if field not in omitted_fields
-        }
+        {field: value for field, value in block.items() if field not in omitted_fields}
         for block in candidate["verse_reasoning"]
     ]
     criteria = f"""افحص دلاليًا سجل العمل الآتي للقصيدة على {meter_name}. لا يكفي تطابق البنية، بل يجب أن يكون كل عنصر تفكيرًا تحريريًا ملموسًا من داخل دور الشاعر ويلتزم تسلسلًا زمنيًا صادقًا:

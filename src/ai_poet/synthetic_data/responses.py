@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Sequence
+from collections.abc import Sequence
+from typing import Any
 
 from .poems import PoemRecord
 
@@ -58,6 +59,35 @@ def render_reasoning(
     return "\n".join(sections).strip()
 
 
+def compose_qcm_response(qcm: dict[str, Any], poem: PoemRecord) -> str:
+    """Compose the assistant response for a QCM record.
+
+    The response contains the exact source poem, the question, the four
+    choices, the reasoning, and the correct answer with its text.
+    """
+    choices = qcm["choices"]
+    correct = qcm["correct_answer"]
+    lines = [
+        poem.poem_text,
+        "",
+        "السؤال:",
+        qcm["question"],
+        "",
+        "الخيارات:",
+        f"A. {choices['A']}",
+        f"B. {choices['B']}",
+        f"C. {choices['C']}",
+        f"D. {choices['D']}",
+        "",
+        "الاستدلال:",
+        qcm["reasoning"],
+        "",
+        f"الإجابة الصحيحة: {correct}",
+        choices[correct],
+    ]
+    return "\n".join(lines)
+
+
 def compose_response(reasoning: str, poem: PoemRecord) -> str:
     """Append one canonical result marker and the exact source poem.
 
@@ -78,9 +108,7 @@ def compose_response(reasoning: str, poem: PoemRecord) -> str:
         )
     if editorial_reasoning.lstrip().startswith(poem.poem_text):
         leading_space = len(editorial_reasoning) - len(editorial_reasoning.lstrip())
-        editorial_reasoning = editorial_reasoning[
-            leading_space + len(poem.poem_text) :
-        ]
+        editorial_reasoning = editorial_reasoning[leading_space + len(poem.poem_text) :]
 
     retained_lines = [
         line.rstrip()

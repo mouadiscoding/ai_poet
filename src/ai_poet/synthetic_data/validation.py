@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, Sequence
-
+from collections.abc import Sequence
+from typing import Any
 
 CODE_FENCE_RE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", re.IGNORECASE)
 ARABIC_MARK_RE = re.compile(r"[\u0610-\u061a\u064b-\u065f\u0670\u06d6-\u06ed\u0640]")
@@ -46,6 +46,18 @@ REASONING_META_PHRASES = (
     "وضعت في الموضوع العام",
     "وضعتُ في الموضوع العام",
     "هذا الحقل",
+)
+
+QCM_KEYS = frozenset({"question", "choices", "reasoning", "correct_answer"})
+QCM_CHOICE_LETTERS = ("A", "B", "C", "D")
+QCM_MIN_REASONING_CHARS = 150
+QCM_MIN_CHOICE_CHARS = 15
+QCM_GENERIC_REASONING_PHRASES = (
+    "لأن النص يتحدث عن ذلك",
+    "لأن القصيدة تتحدث عن ذلك",
+    "الإجابة صحيحة لأن",
+    "الاختيار صحيح لأن",
+    "الجواب صحيح لأن",
 )
 
 DETAILED_REASONING_FIELDS = (
@@ -132,17 +144,16 @@ def instruction_contract_errors(
     if missing_headings:
         label = "heading" if len(missing_headings) == 1 else "headings"
         errors.append(
-            f"instruction is missing required {label}: "
-            + ", ".join(missing_headings)
+            f"instruction is missing required {label}: " + ", ".join(missing_headings)
         )
     if positions[0] > 0:
-        errors.append(
-            "instruction must start exactly with heading: الموضوع العام:"
-        )
+        errors.append("instruction must start exactly with heading: الموضوع العام:")
     if not missing_headings and positions != sorted(positions):
         errors.append("instruction headings are out of order")
     if str(couplet_count) not in instruction:
-        errors.append(f"instruction does not contain numeric couplet count {couplet_count}")
+        errors.append(
+            f"instruction does not contain numeric couplet count {couplet_count}"
+        )
     if meter_name not in instruction:
         errors.append(f"instruction does not name meter {meter_name}")
     if any(
@@ -253,7 +264,11 @@ def extract_reasoning_chunk(
         searchable = "\n".join(
             cleaned[field] for field in DETAILED_REASONING_FIELDS
         ).casefold()
-        found_meta = [phrase for phrase in REASONING_META_PHRASES if phrase.casefold() in searchable]
+        found_meta = [
+            phrase
+            for phrase in REASONING_META_PHRASES
+            if phrase.casefold() in searchable
+        ]
         if found_meta:
             raise ValueError(
                 f"reasoning block {expected_index} contains generation metatext: "
@@ -274,6 +289,105 @@ def extract_reasoning_chunk(
                 + ", ".join(found_meta)
             )
     return overview, cleaned_blocks
+
+
+def extract_qcm(value: dict[str, Any]) -> dict[str, Any]:
+    """Extract and structurally validate one QCM response.
+
+    The QCM must contain exactly ``question``, ``choices``, ``reasoning``, and
+    ``correct_answer``. ``choices`` must hold exactly four non-empty strings
+    under keys A, B, C, and D. The correct answer must be one of those letters.
+    """
+    if set(value) != QCM_KEYS:
+        raise ValueError(
+            "QCM JSON must contain exactly the keys: question, choices, "
+            "reasoning, correct_answer"
+        )
+    question = value["question"]
+    if not isinstance(question, str) or not question.strip():
+        raise ValueError("QCM question must be a non-empty string")
+    choices = value["choices"]
+    if not isinstance(choices, dict) or set(choices) != set(QCM_CHOICE_LETTERS):
+        raise ValueError("QCM choices must be a dict with exactly keys A, B, C, and D")
+    cleaned_choices: dict[str, str] = {}
+    for letter in QCM_CHOICE_LETTERS:
+        choice = choices[letter]
+        if not isinstance(choice, str) or not choice.strip():
+            raise ValueError(f"QCM choice {letter} must be a non-empty string")
+        cleaned_choices[letter] = choice.strip()
+    reasoning = value["reasoning"]
+    if not isinstance(reasoning, str) or not reasoning.strip():
+        raise ValueError("QCM reasoning must be a non-empty string")
+    correct_answer = value["correct_answer"]
+    if correct_answer not in QCM_CHOICE_LETTERS:
+        raise ValueError("QCM correct_answer must be one of A, B, C, D")
+    return {
+        "question": question.strip(),
+        "choices": cleaned_choices,
+        "reasoning": reasoning.strip(),
+        "correct_answer": correct_answer,
+    }
+
+
+def qcm_contract_errors(
+    qcm: dict[str, Any],
+    *,
+    poem: str,
+) -> list[str]:
+    """Return deterministic QCM-contract violations."""
+    errors: list[str] = []
+    if len(qcm["question"]) < 20:
+        errors.append("question is too short; minimum is 20 characters")
+    if len(qcm["reasoning"]) < QCM_MIN_REASONING_CHARS:
+        errors.append(
+            f"reasoning has {len(qcm['reasoning'])} characters; minimum is "
+            f"{QCM_MIN_REASONING_CHARS}"
+        )
+    for letter in QCM_CHOICE_LETTERS:
+        choice = qcm["choices"][letter]
+        if len(choice) < QCM_MIN_CHOICE_CHARS:
+            errors.append(
+                f"choice {letter} has {len(choice)} characters; minimum is "
+                f"{QCM_MIN_CHOICE_CHARS}"
+            )
+    # Only one correct answer is allowed: the designated one.
+    correct_text = qcm["choices"][qcm["correct_answer"]]
+    duplicates = [
+        letter
+        for letter in QCM_CHOICE_LETTERS
+        if letter != qcm["correct_answer"] and qcm["choices"][letter] == correct_text
+    ]
+    if duplicates:
+        errors.append(
+            "correct answer text is duplicated in choices: " + ", ".join(duplicates)
+        )
+
+    # The reasoning must reference the question or the choices or the poem.
+    reasoning = qcm["reasoning"].casefold()
+    if not any(
+        letter in reasoning for letter in ("أ", "ب", "ج", "د", "a", "b", "c", "d")
+    ):
+        errors.append(
+            "reasoning does not reference any choice letter (أ/ب/ج/د or A/B/C/D)"
+        )
+
+    # The reasoning must not be a generic statement.
+    found_generic = [
+        phrase for phrase in QCM_GENERIC_REASONING_PHRASES if phrase in qcm["reasoning"]
+    ]
+    if found_generic:
+        errors.append("reasoning uses a generic statement: " + ", ".join(found_generic))
+
+    # Do not let the reasoning expose generation metatext.
+    searchable = reasoning
+    found_meta = [
+        phrase for phrase in REASONING_META_PHRASES if phrase.casefold() in searchable
+    ]
+    if found_meta:
+        errors.append(
+            "QCM reasoning contains generation metatext: " + ", ".join(found_meta)
+        )
+    return errors
 
 
 def parse_field_verdict(raw: str) -> dict[str, Any]:

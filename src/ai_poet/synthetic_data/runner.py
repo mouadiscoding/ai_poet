@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import hashlib
 from pathlib import Path
 
 from .checkpoint import append_checkpoint, load_checkpoint
@@ -14,12 +14,8 @@ from .corpus import load_poems
 from .errors import GemmaConnectionError
 from .generation import TEMPLATE_RATIONALE, generate_one
 from .outputs import append_jsonl, write_jsonl, write_outputs
-from .prompts.templates import (
-    ALL_FOCUS_REQUIREMENTS,
-    PROMPT_TEMPLATES,
-    TEMPLATE_VERSION,
-)
-from .tracing import GenerationTracer, PRINT_LOCK
+from .prompts.qcm_templates import QCM_PROMPT_TEMPLATES, QCM_TEMPLATE_VERSION
+from .tracing import PRINT_LOCK, GenerationTracer
 
 
 def file_sha256(path: Path) -> str:
@@ -42,7 +38,6 @@ def file_sha256(path: Path) -> str:
         while block := handle.read(1024 * 1024):
             digest.update(block)
     return digest.hexdigest()
-
 
 
 def run(run_settings: RunSettings) -> int:
@@ -86,7 +81,7 @@ def run(run_settings: RunSettings) -> int:
         sample_id: record
         for sample_id, record in successes.items()
         if sample_id in selected_ids
-        and record.get("template_version") == TEMPLATE_VERSION
+        and record.get("template_version") == QCM_TEMPLATE_VERSION
     }
     failures = {
         sample_id: error
@@ -97,11 +92,7 @@ def run(run_settings: RunSettings) -> int:
     sft_jsonl = run_settings.output_dir / "ashaar_sft.jsonl"
     write_jsonl(
         sft_jsonl,
-        (
-            successes[poem.sample_id]
-            for poem in poems
-            if poem.sample_id in successes
-        ),
+        (successes[poem.sample_id] for poem in poems if poem.sample_id in successes),
     )
     source_fingerprint = file_sha256(run_settings.input)
     tracer = (
@@ -135,19 +126,19 @@ def run(run_settings: RunSettings) -> int:
                     "max_network_retries": settings.max_network_retries,
                     "max_repairs": settings.max_repairs,
                 },
-                "template_version": TEMPLATE_VERSION,
+                "template_version": QCM_TEMPLATE_VERSION,
                 "template_rationale": TEMPLATE_RATIONALE,
-                "required_focuses": ALL_FOCUS_REQUIREMENTS,
                 "prompt_templates": [
                     {
                         "template_id": template.template_id,
                         "prompt": template.prompt,
                         "why_available": (
                             "supports both metered and prose records and requires "
-                            "all six poetic dimensions"
+                            "a poem-grounded question, four choices, and a "
+                            "demonstrative reasoning"
                         ),
                     }
-                    for template in PROMPT_TEMPLATES
+                    for template in QCM_PROMPT_TEMPLATES
                 ],
                 "checkpoint_note": (
                     "checkpoint_reused counts existing successful records; all "

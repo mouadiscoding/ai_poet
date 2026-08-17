@@ -3,17 +3,25 @@ from __future__ import annotations
 import json
 import unittest
 
-from ai_poet.synthetic_data.responses import compose_response, render_reasoning
+from ai_poet.synthetic_data.responses import (
+    compose_qcm_response,
+    compose_response,
+    render_reasoning,
+)
 from ai_poet.synthetic_data.validation import (
     extract_instruction,
     extract_json_object,
+    extract_qcm,
     extract_reasoning_chunk,
     instruction_contract_errors,
     parse_field_verdict,
+    qcm_contract_errors,
 )
+
 from tests.synthetic_data_helpers import (
     make_poem,
     valid_instruction_value,
+    valid_qcm_value,
     valid_reasoning_value,
 )
 
@@ -26,9 +34,7 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(extract_json_object(f"```json\n{raw}\n```"), value)
 
     def test_instruction_extraction_requires_one_string_field(self) -> None:
-        self.assertEqual(
-            extract_instruction({"instruction": " تعليمات "}), "تعليمات"
-        )
+        self.assertEqual(extract_instruction({"instruction": " تعليمات "}), "تعليمات")
         with self.assertRaises(ValueError):
             extract_instruction({"instruction": "تعليمات", "reasoning": "زائد"})
         with self.assertRaises(ValueError):
@@ -126,13 +132,17 @@ class ValidationTests(unittest.TestCase):
                 include_overview=True,
             )
 
-    def test_reasoning_chunk_rejects_retrospective_claim_before_first_draft(self) -> None:
+    def test_reasoning_chunk_rejects_retrospective_claim_before_first_draft(
+        self,
+    ) -> None:
         poem = make_poem()
         value = valid_reasoning_value(poem)
         value["verse_reasoning"][0]["imagery_and_diction"] = (
             "استخدمت لفظ الضياء في صياغة البيت لتقوية صورة الرجاء بعد الشدة."
         )
-        with self.assertRaisesRegex(ValueError, "must describe a plan before first_draft"):
+        with self.assertRaisesRegex(
+            ValueError, "must describe a plan before first_draft"
+        ):
             extract_reasoning_chunk(
                 value,
                 expected_indices=[1, 2],
@@ -140,17 +150,63 @@ class ValidationTests(unittest.TestCase):
                 include_overview=True,
             )
 
+    def test_extracts_valid_qcm(self) -> None:
+        poem = make_poem()
+        value = valid_qcm_value(poem)
+        qcm = extract_qcm(value)
+        self.assertEqual(qcm["question"], value["question"])
+        self.assertEqual(qcm["choices"], value["choices"])
+        self.assertEqual(qcm["correct_answer"], "B")
+        self.assertEqual(qcm_contract_errors(qcm, poem=poem.poem_text), [])
+
+    def test_qcm_rejects_wrong_choice_letters(self) -> None:
+        value = valid_qcm_value(make_poem())
+        del value["choices"]["D"]
+        with self.assertRaises(ValueError):
+            extract_qcm(value)
+
+    def test_qcm_rejects_invalid_correct_answer(self) -> None:
+        value = valid_qcm_value(make_poem())
+        value["correct_answer"] = "E"
+        with self.assertRaises(ValueError):
+            extract_qcm(value)
+
+    def test_qcm_rejects_generic_reasoning(self) -> None:
+        poem = make_poem()
+        value = valid_qcm_value(poem)
+        value["reasoning"] = "الإجابة B صحيحة لأن النص يتحدث عن ذلك."
+        qcm = extract_qcm(value)
+        errors = qcm_contract_errors(qcm, poem=poem.poem_text)
+        self.assertIn("reasoning uses a generic statement", str(errors))
+
+    def test_compose_qcm_response_formats_full_pipeline(self) -> None:
+        poem = make_poem()
+        qcm = extract_qcm(valid_qcm_value(poem))
+        response = compose_qcm_response(qcm, poem)
+        self.assertTrue(response.startswith(poem.poem_text))
+        self.assertIn("السؤال:", response)
+        self.assertIn("الخيارات:", response)
+        self.assertIn("الاستدلال:", response)
+        self.assertIn("الإجابة الصحيحة: B", response)
+        self.assertIn(qcm["question"], response)
+        for letter in ("A", "B", "C", "D"):
+            self.assertIn(qcm["choices"][letter], response)
+
     def test_parses_strict_field_verdict(self) -> None:
         raw = json.dumps({"passed": False, "errors": ["الوزن عام"]}, ensure_ascii=False)
         self.assertEqual(
             parse_field_verdict(raw),
             {"passed": False, "errors": ["الوزن عام"]},
         )
-        malformed = json.dumps({"passed": True, "errors": ["تناقض"]}, ensure_ascii=False)
+        malformed = json.dumps(
+            {"passed": True, "errors": ["تناقض"]}, ensure_ascii=False
+        )
         with self.assertRaises(ValueError):
             parse_field_verdict(malformed)
 
-    def test_rendered_response_has_one_block_per_verse_and_exact_final_poem(self) -> None:
+    def test_rendered_response_has_one_block_per_verse_and_exact_final_poem(
+        self,
+    ) -> None:
         poem = make_poem()
         value = valid_reasoning_value(poem)
         reasoning = render_reasoning(

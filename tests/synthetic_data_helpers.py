@@ -10,7 +10,6 @@ from ai_poet.synthetic_data.meters import meter_name
 from ai_poet.synthetic_data.poems import PoemRecord, poem_hash
 from ai_poet.synthetic_data.tracing import GenerationTracer
 
-
 TEST_TMP = Path(__file__).parent / "_tmp"
 
 
@@ -42,9 +41,7 @@ def make_poem(
     )
 
 
-def valid_instruction_value(
-    poem: PoemRecord, minimum: int = 80
-) -> dict[str, str]:
+def valid_instruction_value(poem: PoemRecord, minimum: int = 80) -> dict[str, str]:
     instruction = (
         f"الموضوع العام:\nأنت شاعر عربي فصيح. اكتب {poem.couplet_count} من "
         f"الأبيات على بحر {poem.meter_name} في معنى الصبر والرجاء، ورتب المعاني "
@@ -61,9 +58,7 @@ def valid_instruction_value(
         "ثم اكتب مسودة وانطقها وقطّعها وعدّل اللفظ وافحص كل شطر. "
     )
     if len(instruction) < minimum:
-        instruction += "راجع وحدة المعنى والصورة والقافية. " * (
-            minimum // 35 + 1
-        )
+        instruction += "راجع وحدة المعنى والصورة والقافية. " * (minimum // 35 + 1)
     return {"instruction": instruction}
 
 
@@ -106,12 +101,36 @@ def valid_verdict() -> dict[str, object]:
     return {"passed": True, "errors": []}
 
 
-def valid_pipeline_outputs(poem: PoemRecord) -> list[str]:
-    """Return queued outputs for one successful single-chunk generation."""
+def valid_qcm_value(poem: PoemRecord) -> dict[str, object]:
+    """Return a structurally valid QCM value for offline tests."""
+    return {
+        "question": "ما الفكرة الأساسية التي يبرزها الشاعر في وصف المخاطَب أو الممدوح؟",
+        "choices": {
+            "A": "مدح المخاطَب والإشادة بعلمه وفقهه.",
+            "B": "السخرية من التناقض بين مظهر المخاطَب وادعائه للعلم وبين انشغاله باللهو والملذات.",
+            "C": "وصف رحلة المخاطَب من مدينة إلى أخرى.",
+            "D": "التعبير عن إعجاب الشاعر بقدرة المخاطَب على نظم الشعر.",
+        },
+        "reasoning": (
+            "السؤال يطلب الفكرة الأساسية في وصف المخاطَب. عند النظر في الأبيات، "
+            "لا يبدو أن الشاعر يقصد مدح المخاطَب رغم أنه يصفه في موضع بأنه فقيه "
+            "وعالم. فلو كان المقصود هو المدح لكان وصف العلم والفقه منسجمًا مع "
+            "بقية الصفات، لكن الشاعر ينتقل بعد ذلك إلى الحديث عن تعلقه بالكأس "
+            "واللهو وتركه للفرض والنفل، بل ويشير إلى أن صلاته قد تكون للرياء. "
+            "هذا الانتقال يكشف أن وصفه بالعلم والفقه جاء في سياق ساخر يقوم على "
+            "إبراز التناقض بين ما يُفترض أن يكون عليه العالم وبين سلوك المخاطَب. "
+            "وبمقارنة هذه المعطيات بالاختيارات، نجد أن الاختيار B هو الذي يجمع "
+            "عناصر التناقض والسخرية، بينما لا تستند الاختيارات الأخرى إلى مضمون "
+            "الأبيات."
+        ),
+        "correct_answer": "B",
+    }
+
+
+def valid_qcm_pipeline_outputs(poem: PoemRecord) -> list[str]:
+    """Return queued outputs for one successful QCM generation."""
     return [
-        json.dumps(valid_instruction_value(poem), ensure_ascii=False),
-        json.dumps(valid_verdict(), ensure_ascii=False),
-        json.dumps(valid_reasoning_value(poem), ensure_ascii=False),
+        json.dumps(valid_qcm_value(poem), ensure_ascii=False),
         json.dumps(valid_verdict(), ensure_ascii=False),
     ]
 

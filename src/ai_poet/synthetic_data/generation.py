@@ -1,39 +1,31 @@
-"""Generate, validate, repair, and assemble one synthetic SFT record."""
+"""Generate, validate, repair, and assemble one synthetic QCM SFT record."""
 
 from __future__ import annotations
 
 import json
 import random
-from typing import Any, Sequence
+from typing import Any
 
 from .assignment import sft_split
 from .client import GemmaClient
 from .config import GenerationSettings
 from .errors import GenerationError
 from .poems import PoemRecord, split_poem_chunks
-from .prompts.builder import (
-    build_instruction_validation_messages,
-    build_messages,
-    build_reasoning_messages,
-    build_reasoning_validation_messages,
-)
-from .prompts.templates import PROMPT_TEMPLATES, TEMPLATE_VERSION
-from .responses import compose_response, render_reasoning
+from .prompts.builder import build_qcm_messages, build_qcm_validation_messages
+from .prompts.qcm_templates import QCM_PROMPT_TEMPLATES, QCM_TEMPLATE_VERSION
+from .responses import compose_qcm_response
 from .validation import (
-    extract_instruction,
     extract_json_object,
-    extract_reasoning_chunk,
-    instruction_contract_errors,
+    extract_qcm,
     parse_field_verdict,
+    qcm_contract_errors,
 )
-
-
-REASONING_CHUNK_COUPLETS = 3
 
 TEMPLATE_RATIONALE = (
-    "Six concrete prompts vary the order and framing of instruction "
-    "reconstruction while every prompt requires all six poetic dimensions. "
-    "Verse-level editorial work is generated separately in bounded chunks."
+    "Four QCM prompt templates vary the framing and analytical entry point "
+    "while every template requires a poem-grounded question, four plausible "
+    "choices with one correct answer, and a demonstrative reasoning that "
+    "follows the full conceptual path from question to answer."
 )
 
 
@@ -44,7 +36,11 @@ def _emit_client_trace(client: Any, event: dict[str, Any]) -> None:
 
 
 def _chunk_analysis(client: GemmaClient, poem: PoemRecord, max_chars: int) -> str:
-    """Summarize a long poem for the global instruction-generation stage."""
+    """Summarize a long poem for the global QCM-generation stage.
+
+    The summaries cover the whole poem ordered by chunk, so a global QCM can be
+    built from the entire poem text rather than from a single chunk.
+    """
     summaries: list[str] = []
     chunks = split_poem_chunks(poem.verses, max_chars)
     for index, chunk in enumerate(chunks, start=1):
@@ -85,9 +81,9 @@ def _chunk_analysis(client: GemmaClient, poem: PoemRecord, max_chars: int) -> st
 
 
 def _repair_messages(
-    base_messages: Sequence[dict[str, str]],
+    base_messages: list[dict[str, str]],
     raw: str,
-    errors: Sequence[str],
+    errors: list[str],
 ) -> list[dict[str, str]]:
     """Append one complete rejected answer and actionable repair feedback."""
     return [
@@ -104,7 +100,7 @@ def _repair_messages(
     ]
 
 
-def _generate_instruction(
+def _generate_qcm(
     *,
     poem: PoemRecord,
     client: GemmaClient,
@@ -112,55 +108,48 @@ def _generate_instruction(
     template: Any,
     source_material: str,
     seed: int,
-) -> tuple[str, int]:
-    """Generate and independently validate the writing instruction."""
-    base_messages = build_messages(
+) -> tuple[dict[str, Any], int]:
+    """Generate and independently validate one QCM for a poem."""
+    base_messages = build_qcm_messages(
         template=template,
         meter_name=poem.meter_name,
         couplet_count=poem.couplet_count,
         poem=source_material,
-        minimum_chars=settings.min_chars,
     )
     raw = ""
     errors: list[str] = []
     for repair in range(settings.max_repairs + 1):
         messages = (
-            base_messages if repair == 0 else _repair_messages(base_messages, raw, errors)
+            base_messages
+            if repair == 0
+            else _repair_messages(base_messages, raw, errors)
         )
         raw = client.chat(
             messages,
             seed=seed + repair,
             trace_context={
                 "sample_id": poem.sample_id,
-                "request_kind": (
-                    "instruction_generation" if repair == 0 else "instruction_repair"
-                ),
+                "request_kind": "qcm_generation" if repair == 0 else "qcm_repair",
                 "generation_attempt": repair + 1,
                 "repair_index": repair,
                 "template_id": template.template_id,
             },
         )
         try:
-            instruction = extract_instruction(extract_json_object(raw))
-            errors = instruction_contract_errors(
-                instruction,
-                meter_name=poem.meter_name,
-                couplet_count=poem.couplet_count,
-                minimum_chars=settings.min_chars,
-                source_hemistichs=poem.verses,
-            )
+            qcm = extract_qcm(extract_json_object(raw))
+            errors = qcm_contract_errors(qcm, poem=poem.poem_text)
         except (ValueError, json.JSONDecodeError) as exc:
-            instruction = ""
+            qcm = {}
             errors = [str(exc)]
 
         _emit_client_trace(
             client,
             {
-                "event": "instruction_generation_result",
+                "event": "qcm_generation_result",
                 "sample_id": poem.sample_id,
                 "generation_attempt": repair + 1,
                 "raw_model_content": raw,
-                "parsed_instruction": instruction or None,
+                "parsed_qcm": qcm or None,
                 "passed": not errors,
                 "deterministic_errors": errors,
             },
@@ -169,19 +158,16 @@ def _generate_instruction(
             continue
 
         validation_raw = client.chat(
-            build_instruction_validation_messages(
-                instruction=instruction,
-                meter_name=poem.meter_name,
-                couplet_count=poem.couplet_count,
+            build_qcm_validation_messages(
                 poem=source_material,
-                minimum_chars=settings.min_chars,
+                candidate=qcm,
             ),
             max_tokens=1200,
             temperature=0.0,
             seed=seed + 100_000 + repair,
             trace_context={
                 "sample_id": poem.sample_id,
-                "request_kind": "instruction_validation",
+                "request_kind": "qcm_validation",
                 "generation_attempt": repair + 1,
                 "template_id": template.template_id,
             },
@@ -190,15 +176,13 @@ def _generate_instruction(
             verdict = parse_field_verdict(validation_raw)
         except (ValueError, json.JSONDecodeError) as exc:
             raise GenerationError(
-                f"Gemma instruction validation response was invalid: {exc}"
+                f"Gemma QCM validation response was invalid: {exc}"
             ) from exc
-        errors = [
-            f"Gemma rejected instruction: {error}" for error in verdict["errors"]
-        ]
+        errors = [f"Gemma rejected QCM: {error}" for error in verdict["errors"]]
         _emit_client_trace(
             client,
             {
-                "event": "instruction_validation_result",
+                "event": "qcm_validation_result",
                 "sample_id": poem.sample_id,
                 "generation_attempt": repair + 1,
                 "raw_validator_content": validation_raw,
@@ -208,145 +192,9 @@ def _generate_instruction(
             },
         )
         if not errors:
-            return instruction, repair + 1
+            return qcm, repair + 1
 
-    raise GenerationError(
-        "instruction remained invalid after repairs: " + "; ".join(errors)
-    )
-
-
-def _generate_reasoning_chunk(
-    *,
-    poem: PoemRecord,
-    client: GemmaClient,
-    settings: GenerationSettings,
-    instruction: str,
-    all_couplets: Sequence[str],
-    start_offset: int,
-    chunk_couplets: Sequence[str],
-    seed: int,
-) -> tuple[str | None, list[dict[str, Any]], int]:
-    """Generate and independently validate one bounded verse-work chunk."""
-    start_index = start_offset + 1
-    expected_indices = list(
-        range(start_index, start_index + len(chunk_couplets))
-    )
-    include_overview = start_offset == 0
-    base_messages = build_reasoning_messages(
-        instruction=instruction,
-        meter_name=poem.meter_name,
-        total_couplet_count=poem.couplet_count,
-        start_index=start_index,
-        couplets=chunk_couplets,
-        previous_couplet=(all_couplets[start_offset - 1] if start_offset else None),
-        next_couplet=(
-            all_couplets[start_offset + len(chunk_couplets)]
-            if start_offset + len(chunk_couplets) < len(all_couplets)
-            else None
-        ),
-        include_overview=include_overview,
-    )
-    raw = ""
-    errors: list[str] = []
-    for repair in range(settings.max_repairs + 1):
-        messages = (
-            base_messages if repair == 0 else _repair_messages(base_messages, raw, errors)
-        )
-        raw = client.chat(
-            messages,
-            seed=seed + 10_000 + start_index * 100 + repair,
-            trace_context={
-                "sample_id": poem.sample_id,
-                "request_kind": (
-                    "reasoning_generation" if repair == 0 else "reasoning_repair"
-                ),
-                "chunk_start": start_index,
-                "chunk_end": expected_indices[-1],
-                "generation_attempt": repair + 1,
-                "repair_index": repair,
-            },
-        )
-        try:
-            value = extract_json_object(raw)
-            overview, blocks = extract_reasoning_chunk(
-                value,
-                expected_indices=expected_indices,
-                expected_couplets=chunk_couplets,
-                include_overview=include_overview,
-            )
-            errors = []
-        except (ValueError, json.JSONDecodeError) as exc:
-            value = {}
-            overview = None
-            blocks = []
-            errors = [str(exc)]
-
-        _emit_client_trace(
-            client,
-            {
-                "event": "reasoning_chunk_generation_result",
-                "sample_id": poem.sample_id,
-                "chunk_start": start_index,
-                "chunk_end": expected_indices[-1],
-                "generation_attempt": repair + 1,
-                "raw_model_content": raw,
-                "parsed_output": value or None,
-                "passed": not errors,
-                "deterministic_errors": errors,
-            },
-        )
-        if errors:
-            continue
-
-        validation_raw = client.chat(
-            build_reasoning_validation_messages(
-                instruction=instruction,
-                meter_name=poem.meter_name,
-                expected_couplets=chunk_couplets,
-                candidate=value,
-            ),
-            max_tokens=1200,
-            temperature=0.0,
-            seed=seed + 200_000 + start_index * 100 + repair,
-            trace_context={
-                "sample_id": poem.sample_id,
-                "request_kind": "reasoning_validation",
-                "chunk_start": start_index,
-                "chunk_end": expected_indices[-1],
-                "generation_attempt": repair + 1,
-            },
-        )
-        try:
-            verdict = parse_field_verdict(validation_raw)
-        except (ValueError, json.JSONDecodeError) as exc:
-            raise GenerationError(
-                f"Gemma reasoning validation response was invalid: {exc}"
-            ) from exc
-        errors = [
-            f"Gemma rejected reasoning: {error}" for error in verdict["errors"]
-        ]
-        _emit_client_trace(
-            client,
-            {
-                "event": "reasoning_chunk_validation_result",
-                "sample_id": poem.sample_id,
-                "chunk_start": start_index,
-                "chunk_end": expected_indices[-1],
-                "generation_attempt": repair + 1,
-                "raw_validator_content": validation_raw,
-                "parsed_verdict": verdict,
-                "passed": not errors,
-                "validation_errors": errors,
-            },
-        )
-        if not errors:
-            return overview, blocks, repair + 1
-
-    raise GenerationError(
-        f"reasoning chunk {start_index}-{expected_indices[-1]} remained invalid "
-        "after repairs: "
-        + "; ".join(errors)
-    )
+    raise GenerationError("QCM remained invalid after repairs: " + "; ".join(errors))
 
 
 def generate_one(
@@ -354,8 +202,8 @@ def generate_one(
     client: GemmaClient,
     settings: GenerationSettings,
 ) -> dict[str, Any]:
-    """Generate one instruction and a validated editorial block per couplet."""
-    template = random.choice(PROMPT_TEMPLATES)
+    """Generate one poem-grounded multiple-choice question."""
+    template = random.choice(QCM_PROMPT_TEMPLATES)
     _emit_client_trace(
         client,
         {
@@ -367,11 +215,13 @@ def generate_one(
             "meter_name": poem.meter_name,
             "couplet_count": poem.couplet_count,
             "source_characters": len(poem.poem_text),
-            "eligible_template_ids": [item.template_id for item in PROMPT_TEMPLATES],
+            "eligible_template_ids": [
+                item.template_id for item in QCM_PROMPT_TEMPLATES
+            ],
             "selected_template_id": template.template_id,
             "why_used": {
                 "purpose": TEMPLATE_RATIONALE,
-                "eligibility": "all six templates support metered and prose poems",
+                "eligibility": "all four QCM templates support metered and prose poems",
                 "selection": "fresh uniform random choice, made once for this call",
             },
         },
@@ -380,13 +230,13 @@ def generate_one(
     oversized = len(poem.poem_text) > settings.max_source_chars
     notes = _chunk_analysis(client, poem, settings.chunk_chars) if oversized else None
     source_material = (
-        "القصيدة طويلة؛ هذه ملخصات مرتبة لبناء التكليف العام من غير افتراض "
-        f"ما لم تذكره:\n{notes}"
+        "القصيدة طويلة جدًا؛ هذه ملخصات مرتبة لكل مقاطعها لبناء سؤال "
+        f"عام يستند إلى القصيدة كلها من غير افتراض ما لم تذكره:\n{notes}"
         if oversized
         else poem.poem_text
     )
     seed = int(poem.sample_id[:8], 16)
-    instruction, instruction_attempts = _generate_instruction(
+    qcm, generation_attempts = _generate_qcm(
         poem=poem,
         client=client,
         settings=settings,
@@ -395,46 +245,8 @@ def generate_one(
         seed=seed,
     )
 
-    all_couplets = poem.poem_text.splitlines()
-    overview: str | None = None
-    all_blocks: list[dict[str, Any]] = []
-    reasoning_attempts = 0
-    chunk_count = 0
-    for start_offset in range(0, len(all_couplets), REASONING_CHUNK_COUPLETS):
-        chunk_count += 1
-        chunk_couplets = all_couplets[
-            start_offset : start_offset + REASONING_CHUNK_COUPLETS
-        ]
-        chunk_overview, blocks, attempts = _generate_reasoning_chunk(
-            poem=poem,
-            client=client,
-            settings=settings,
-            instruction=instruction,
-            all_couplets=all_couplets,
-            start_offset=start_offset,
-            chunk_couplets=chunk_couplets,
-            seed=seed,
-        )
-        if chunk_overview is not None:
-            overview = chunk_overview
-        all_blocks.extend(blocks)
-        reasoning_attempts += attempts
-
-    if overview is None:
-        raise GenerationError("first reasoning chunk did not produce an overview")
-    if [block["verse_index"] for block in all_blocks] != list(
-        range(1, poem.couplet_count + 1)
-    ):
-        raise GenerationError("assembled reasoning does not cover every couplet once")
-
-    editorial_reasoning = render_reasoning(
-        overview,
-        all_blocks,
-        is_prose=poem.meter_name == "النثر",
-    )
-    response = compose_response(editorial_reasoning, poem)
-    generation_attempts = instruction_attempts + reasoning_attempts
-    repaired = instruction_attempts > 1 or reasoning_attempts > chunk_count
+    response = compose_qcm_response(qcm, poem)
+    repaired = generation_attempts > 1
     record = {
         "sample_id": poem.sample_id,
         "source_row_indices": list(poem.source_row_indices),
@@ -444,21 +256,23 @@ def generate_one(
         "meter_id": poem.meter_id,
         "meter_name": poem.meter_name,
         "couplet_count": poem.couplet_count,
+        "poem": poem.poem_text,
+        "question": qcm["question"],
+        "choices": qcm["choices"],
+        "reasoning": qcm["reasoning"],
+        "correct_answer": qcm["correct_answer"],
+        "correct_answer_text": qcm["choices"][qcm["correct_answer"]],
         "template_id": template.template_id,
-        "template_version": TEMPLATE_VERSION,
-        "instruction": instruction,
+        "template_version": QCM_TEMPLATE_VERSION,
         "response": response,
         "messages": [
-            {"role": "user", "content": instruction},
+            {"role": "user", "content": poem.poem_text},
             {"role": "assistant", "content": response},
         ],
         "sft_split": sft_split(poem.sample_id),
         "oversized_for_sft": oversized,
         "metadata_conflict": poem.metadata_conflict,
         "generation_attempts": generation_attempts,
-        "instruction_generation_attempts": instruction_attempts,
-        "reasoning_generation_attempts": reasoning_attempts,
-        "reasoning_chunk_count": chunk_count,
         "validation_status": "passed_after_repair" if repaired else "passed",
     }
     _emit_client_trace(
@@ -467,18 +281,16 @@ def generate_one(
             "event": "final_output",
             "sample_id": poem.sample_id,
             "template_id": template.template_id,
-            "parsed_instruction": instruction,
-            "reasoning_overview": overview,
-            "structured_verse_reasoning": all_blocks,
-            "rendered_editorial_reasoning": editorial_reasoning,
+            "parsed_qcm": qcm,
             "final_assistant_response": response,
             "postprocessing": {
-                "full_poem_occurrences_removed": editorial_reasoning.count(
-                    poem.poem_text
+                "exact_source_poem_present": poem.poem_text in response,
+                "question_present": qcm["question"] in response,
+                "all_choices_present": all(
+                    qcm["choices"][letter] in response
+                    for letter in ("A", "B", "C", "D")
                 ),
-                "quoted_source_couplets_preserved": len(all_blocks),
-                "canonical_result_marker_added": True,
-                "exact_source_poem_appended": True,
+                "correct_answer_present": qcm["correct_answer"] in response,
             },
             "generation_attempts": generation_attempts,
             "validation_status": record["validation_status"],
