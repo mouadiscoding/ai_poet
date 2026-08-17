@@ -23,6 +23,7 @@ from ai_poet.synthetic_data.tasks.mcq import (
     question_domain,
 )
 from ai_poet.synthetic_data.tasks.reconstruction import (
+    build_generation_messages as build_reconstruction_messages,
     corruption_count,
     extract_candidate as extract_reconstruction_candidate,
     generate_one as generate_reconstruction,
@@ -109,7 +110,7 @@ class TaskRegistryTests(unittest.TestCase):
             TASK_POEM_GENERATION,
         )
         self.assertEqual(get_task_workflow(TASK_MCQ).version, 1)
-        self.assertEqual(get_task_workflow(TASK_POEM_RECONSTRUCTION).version, 1)
+        self.assertEqual(get_task_workflow(TASK_POEM_RECONSTRUCTION).version, 2)
         self.assertEqual(default_output_dir(TASK_MCQ), Path("data/ashaar_mcq_sft"))
 
     def test_output_directory_rejects_another_task(self) -> None:
@@ -295,6 +296,83 @@ class ReconstructionWorkflowTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "complete original poem"):
             extract_reconstruction_candidate(
                 leaked,
+                poem=poem,
+                expected_count=corruption_count(poem),
+            )
+
+    def test_prompt_defines_one_based_couplet_indices(self) -> None:
+        poem = make_poem()
+        messages = build_reconstruction_messages(poem, corruption_count(poem))
+        self.assertIn("couplet_index يبدأ من 1", messages[0]["content"])
+        self.assertIn("20 حرفًا على الأقل", messages[0]["content"])
+
+    def test_zero_based_couplet_indices_are_canonicalized(self) -> None:
+        poem, candidate = valid_reconstruction_candidate()
+        for repair in candidate["repairs"]:
+            repair["couplet_index"] -= 1
+
+        parsed = extract_reconstruction_candidate(
+            candidate,
+            poem=poem,
+            expected_count=corruption_count(poem),
+        )
+
+        self.assertEqual(
+            [repair["couplet_index"] for repair in parsed["repairs"]],
+            list(range(1, corruption_count(poem) + 1)),
+        )
+
+    def test_diacritic_only_fragment_difference_uses_exact_source_text(self) -> None:
+        poem = make_poem(
+            verses=("جاء الرَبيع بالبشائر", "فأضحى الروض مبتسما"),
+        )
+        candidate = {
+            "corrupted_poem": poem.poem_text.replace("الرَبيع", "الشتاء"),
+            "repairs": [
+                {
+                    "couplet_index": 1,
+                    "corrupted_fragment": "الشتاء",
+                    "corrected_fragment": "الربيع",
+                    "diagnosis": "يخالف هذا الفصل صورة البشائر والنماء التي يبنيها البيت.",
+                    "context_evidence": "يربط السياق مجيء الفصل بالبشائر وابتسام الروض بعده.",
+                    "repair_reason": "يعيد اللفظ الأصلي الترابط بين الفصل والنماء في صورة البيت.",
+                }
+            ],
+        }
+
+        parsed = extract_reconstruction_candidate(
+            candidate,
+            poem=poem,
+            expected_count=1,
+        )
+
+        self.assertEqual(parsed["repairs"][0]["corrected_fragment"], "الرَبيع")
+
+    def test_index_mismatch_reports_actual_and_one_based_indices(self) -> None:
+        poem, candidate = valid_reconstruction_candidate()
+        for repair in candidate["repairs"]:
+            repair["couplet_index"] += 10
+
+        with self.assertRaisesRegex(
+            ValueError,
+            r"reported repair couplet indices .* changed couplets .* one-based",
+        ):
+            extract_reconstruction_candidate(
+                candidate,
+                poem=poem,
+                expected_count=corruption_count(poem),
+            )
+
+    def test_short_repair_detail_reports_required_length(self) -> None:
+        poem, candidate = valid_reconstruction_candidate()
+        candidate["repairs"][0]["context_evidence"] = "شاهد قصير"
+
+        with self.assertRaisesRegex(
+            ValueError,
+            r"context_evidence must contain at least 20 characters",
+        ):
+            extract_reconstruction_candidate(
+                candidate,
                 poem=poem,
                 expected_count=corruption_count(poem),
             )

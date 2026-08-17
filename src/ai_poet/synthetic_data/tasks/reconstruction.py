@@ -5,12 +5,13 @@ from __future__ import annotations
 from difflib import SequenceMatcher
 import hashlib
 import json
+import unicodedata
 from typing import Any, Sequence
 
 from ..assignment import sft_split
 from ..errors import GenerationError
 from ..poems import PoemRecord
-from ..validation import extract_json_object
+from ..validation import ARABIC_MARK_RE, extract_json_object
 from ..workflow import (
     client_provenance,
     emit_client_trace,
@@ -20,10 +21,11 @@ from ..workflow import (
 from .base import TASK_POEM_RECONSTRUCTION, TaskWorkflow
 
 
-TASK_VERSION = 1
+TASK_VERSION = 2
 MAX_FRAGMENT_WORDS = 3
+MIN_DETAIL_CHARS = 20
 
-SYSTEM_PROMPT = """أنت تنشئ مثالًا لتدريب نموذج على إصلاح قصيدة عربية محرّفة. ستتلقى القصيدة الأصلية وعدد التحريفات المطلوب. اكتب نسخة محرّفة كاملة تحافظ حرفيًا على عدد الأبيات وترتيبها وعلامة = في كل بيت. غيّر في كل بيت مختار كلمة واحدة أو عبارة متصلة لا تتجاوز ثلاث كلمات، ولا تحذف أو تضف أو تنقل بيتًا. لا تنشئ القصيدة الأصلية كاملة في reasoning.
+SYSTEM_PROMPT = """أنت تنشئ مثالًا لتدريب نموذج على إصلاح قصيدة عربية محرّفة. ستتلقى القصيدة الأصلية وعدد التحريفات المطلوب. اكتب نسخة محرّفة كاملة تحافظ حرفيًا على عدد الأبيات وترتيبها وعلامة = في كل بيت. غيّر في كل بيت مختار كلمة واحدة أو عبارة متصلة لا تتجاوز ثلاث كلمات، ولا تحذف أو تضف أو تنقل بيتًا. لا تنشئ القصيدة الأصلية كاملة في reasoning. ترقيم couplet_index يبدأ من 1: السطر الأول رقمه 1، والسطر الثاني رقمه 2، وهكذا، ويجب أن يشير كل رقم إلى السطر الذي غُيّر فعلًا. يجب أن يكون كل من diagnosis وcontext_evidence وrepair_reason شرحًا مفصلًا من 20 حرفًا على الأقل.
 
 أعد كائن JSON فقط بالمفتاحين corrupted_poem وrepairs. repairs قائمة بعدد التحريفات، ولكل عنصر المفاتيح couplet_index وcorrupted_fragment وcorrected_fragment وdiagnosis وcontext_evidence وrepair_reason. يجوز ذكر اللفظ أو العبارة المصححة محليًا، لكن لا تنسخ البيت الأصلي كاملًا."""
 
@@ -84,6 +86,19 @@ def _single_replacement(
     return " ".join(corrupted_fragment), " ".join(original_fragment)
 
 
+def _normalize_fragment(value: str) -> str:
+    return " ".join(unicodedata.normalize("NFC", value).split())
+
+
+def _fragment_matches(reported: str, actual: str) -> bool:
+    reported_normalized = _normalize_fragment(reported)
+    actual_normalized = _normalize_fragment(actual)
+    return reported_normalized == actual_normalized or (
+        ARABIC_MARK_RE.sub("", reported_normalized)
+        == ARABIC_MARK_RE.sub("", actual_normalized)
+    )
+
+
 def extract_candidate(
     value: dict[str, Any],
     *,
@@ -120,9 +135,6 @@ def extract_candidate(
 
     if not isinstance(repairs, list) or len(repairs) != expected_count:
         raise ValueError(f"repairs must contain exactly {expected_count} items")
-    cleaned_repairs: list[dict[str, Any]] = []
-    seen: set[int] = set()
-    generated_reasoning: list[str] = []
     required_fields = {
         "couplet_index",
         "corrupted_fragment",
@@ -134,19 +146,46 @@ def extract_candidate(
     for repair in repairs:
         if not isinstance(repair, dict) or set(repair) != required_fields:
             raise ValueError("each repair must contain exactly the required fields")
-        index = repair["couplet_index"]
-        if not isinstance(index, int) or index not in diffs or index in seen:
-            raise ValueError("repair couplet indices must match changed couplets once")
+
+    changed_indices = sorted(diffs)
+    reported_indices = [repair["couplet_index"] for repair in repairs]
+    if not all(type(index) is int for index in reported_indices):
+        raise ValueError("repair couplet indices must be integers")
+    if sorted(reported_indices) == changed_indices:
+        index_offset = 0
+    elif sorted(reported_indices) == [index - 1 for index in changed_indices]:
+        # Gemma sometimes applies JSON's zero-based convention despite the prompt.
+        # The poem diff remains authoritative, so this conversion is unambiguous.
+        index_offset = 1
+    else:
+        raise ValueError(
+            f"reported repair couplet indices {reported_indices} must match changed "
+            f"couplets {changed_indices} exactly once using one-based numbering"
+        )
+
+    cleaned_repairs: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    generated_reasoning: list[str] = []
+    for repair in repairs:
+        index = repair["couplet_index"] + index_offset
+        if index in seen:
+            raise ValueError("repairs must cover each changed couplet exactly once")
         seen.add(index)
         corrupted_fragment, corrected_fragment = diffs[index]
         if not isinstance(repair["corrupted_fragment"], str) or (
-            " ".join(repair["corrupted_fragment"].split()) != corrupted_fragment
+            not _fragment_matches(repair["corrupted_fragment"], corrupted_fragment)
         ):
-            raise ValueError("repair corrupted_fragment must match the actual diff")
+            raise ValueError(
+                f"repair {index} corrupted_fragment must match the actual diff "
+                f"{json.dumps(corrupted_fragment, ensure_ascii=False)}"
+            )
         if not isinstance(repair["corrected_fragment"], str) or (
-            " ".join(repair["corrected_fragment"].split()) != corrected_fragment
+            not _fragment_matches(repair["corrected_fragment"], corrected_fragment)
         ):
-            raise ValueError("repair corrected_fragment must match the original diff")
+            raise ValueError(
+                f"repair {index} corrected_fragment must match the original diff "
+                f"{json.dumps(corrected_fragment, ensure_ascii=False)}"
+            )
         cleaned = {
             "couplet_index": index,
             "corrupted_fragment": corrupted_fragment,
@@ -154,8 +193,12 @@ def extract_candidate(
         }
         for field in ("diagnosis", "context_evidence", "repair_reason"):
             detail = repair[field]
-            if not isinstance(detail, str) or len(detail.strip()) < 20:
-                raise ValueError(f"repair {index} field {field} must be detailed")
+            detail_length = len(detail.strip()) if isinstance(detail, str) else 0
+            if detail_length < MIN_DETAIL_CHARS:
+                raise ValueError(
+                    f"repair {index} field {field} must contain at least "
+                    f"{MIN_DETAIL_CHARS} characters; got {detail_length}"
+                )
             cleaned[field] = detail.strip()
             generated_reasoning.append(detail.strip())
         generated_reasoning.extend([corrupted_fragment, corrected_fragment])

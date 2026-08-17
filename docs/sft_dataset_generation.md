@@ -26,8 +26,9 @@ checkpointing, splits, and exporters:
   option. Python shuffles and labels the four choices reproducibly.
 - `poem-reconstruction` asks Gemma for a complete structurally preserved
   corrupted poem and detailed local repair records. Python validates every
-  one-to-three-word replacement and appends the exact source poem; Gemma never
-  emits the complete corrected poem.
+  one-to-three-word replacement, canonicalizes unambiguous zero-based indices
+  and diacritic-only fragment variants from the exact local diff, and appends
+  the exact source poem; Gemma never emits the complete corrected poem.
 
 All three commands accept `--task poem-generation`, `--task mcq`, or
 `--task poem-reconstruction`. The first remains the default. Each task has its
@@ -600,7 +601,8 @@ It covers:
 - Deterministic MCQ domains and choice ordering, unique-answer validation, and
   exact final-answer formatting.
 - Stable reconstruction severity, localized diff enforcement, reasoning
-  coverage, and byte-exact source-poem appending.
+  coverage, index and Arabic-diacritic canonicalization, and byte-exact
+  source-poem appending.
 - Task-isolated fingerprints, manifests, pilots, and version-3 checkpoints.
 
 Before a full production run is accepted, verify that:
