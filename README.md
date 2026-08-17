@@ -12,9 +12,10 @@ This project builds Arabic supervised fine-tuning datasets from
 - `poem-reconstruction` creates localized corruptions, explains their repair,
   and lets Python append the trusted original poem.
 
-The generator randomly chooses one of six concrete prompt templates for each
-poem. Every template and every few-shot example covers prosody or internal
-rhythm, semantic progression, imagery, voice, occasion, and diction/revision.
+The poem-generation workflow randomly chooses one of six concrete prompt
+templates for each poem. Every template and every few-shot example covers
+prosody or internal rhythm, semantic progression, imagery, voice, occasion,
+and diction/revision.
 Metered and prose poems have separate demonstrations.
 
 See [the complete SFT generation guide](docs/sft_dataset_generation.md) for the
@@ -28,15 +29,34 @@ and orchestration. Tests mirror those boundaries under `tests/unit` and
 `tests/integration`. Future workflows such as fine-tuning can be added as
 sibling packages under `src/ai_poet` without coupling them to data generation.
 
-## Security first
+## Configure API credentials
 
 Never put an API key in the repository or command line. Revoke any key that has
-been pasted into chat, shell history, or logs, then create a local `.env` from
-the committed example and fill in the model plus all three endpoint records:
+been pasted into chat, shell history, or logs. Create a local configuration
+from the committed example, then keep only the variables for the endpoint mode
+you intend to use:
 
 ```powershell
 Copy-Item .env_example .env
 ```
+
+### One API endpoint
+
+Use only the unindexed variables:
+
+```dotenv
+GEMMA_ENDPOINT=https://host.example/v1/chat/completions
+GEMMA_MODEL=your-model-name
+GEMMA_API_KEY=replace-with-endpoint-token
+```
+
+Remove `GEMMA_ENDPOINT_1..3`, `GEMMA_MODEL_1..3`, and
+`GEMMA_API_KEY_1..3` from `.env`; indexed and unindexed endpoint settings
+cannot be mixed.
+
+### Three API endpoints
+
+Use exactly the indexed endpoint records 1 through 3:
 
 ```dotenv
 GEMMA_ENDPOINT_1=https://host-1.example/v1/chat/completions
@@ -53,131 +73,147 @@ GEMMA_API_KEY_3=replace-with-endpoint-3-token
 GEMMA_MAX_CONCURRENCY_3=32
 ```
 
-The indexed configuration must contain exactly endpoints 1 through 3 and must
-not be mixed with the legacy variables. Use `GEMMA_MODEL_1..3` when deployments
-expose different served-model aliases. If all aliases are identical, one shared
-`GEMMA_MODEL` may replace them; the two model forms cannot be mixed. A
-single-endpoint run remains available through `GEMMA_ENDPOINT`,
-`GEMMA_API_KEY`, and `GEMMA_MODEL`.
+Remove `GEMMA_ENDPOINT` and `GEMMA_API_KEY`. If all three deployments use the
+same served-model name, one shared `GEMMA_MODEL` may replace
+`GEMMA_MODEL_1..3`; do not use both model forms.
 
-The client verifies TLS certificates by default. An internal endpoint may
-require `--insecure`, which is equivalent to `curl -k`; use that flag only for
-an endpoint you trust. Process-environment values override matching `.env`
-values.
+The client verifies TLS certificates by default. Append `--insecure` to a
+command only when all relevant internal endpoints use certificates you trust
+but cannot verify normally. Process-environment values override matching
+`.env` values.
 
-## Benchmark, pilot, and generate
+## Choose the command sequence
 
-First measure each endpoint in isolation and all three together. The command is
-resumable and writes a certified `endpoint_capacity.json` only when the
-throughput, error-rate, convergence, model, and combined-speedup gates pass:
+First select exactly one task configuration in the PowerShell session where
+you will run the commands. The task, output directory, and capacity directory
+must stay together because benchmark and pilot artifacts cannot be reused
+across tasks.
 
-```powershell
-uv run ai-poet-benchmark-endpoints `
-  --input data/ashaar_classic_moroccan.parquet `
-  --output-dir data/gemma_capacity `
-  --insecure
-```
-
-The default benchmark warms each level for 30 seconds and measures it for five
-minutes. Use `--duration-per-level` and `--warmup-seconds` only for development;
-a shortened benchmark is not representative production evidence.
-
-Run the deterministic 300-poem pilot into the final output directory. Accepted
-pilot records are written to the normal checkpoint and reused by the corpus
-run:
+### Task: poem generation
 
 ```powershell
-uv run ai-poet-pilot-sft `
-  --input data/ashaar_classic_moroccan.parquet `
-  --output-dir data/ashaar_sft `
-  --capacity-report data/gemma_capacity/endpoint_capacity.json `
-  --insecure
+$task = "poem-generation"
+$outputDir = "data/ashaar_sft"
+$capacityDir = "data/gemma_capacity"
 ```
 
-The pilot must reach 98% final success, at most 25% repaired samples, and zero
-truncations. Inspect the 30 records listed in `pilot_review.json`, set every
-accepted entry's `approved` value to `true`, and add notes where useful. Then
-start the complete run:
+### Task: MCQ
 
 ```powershell
-uv run ai-poet-generate-sft `
-  --input data/ashaar_classic_moroccan.parquet `
-  --output-dir data/ashaar_sft `
-  --capacity-report data/gemma_capacity/endpoint_capacity.json `
-  --pilot-report data/ashaar_sft/pilot_report.json `
-  --pilot-review data/ashaar_sft/pilot_review.json `
-  --max-couplets 24 `
-  --insecure
+$task = "mcq"
+$outputDir = "data/ashaar_mcq_sft"
+$capacityDir = "data/gemma_capacity_mcq"
 ```
 
-To deliberately run without either pilot artifact, pass
-`--skip-pilot-review`. This bypasses the capacity report, automated pilot
-report, and human review gate and prints a yellow warning. Without a capacity
-report, the run uses each endpoint's configured `GEMMA_MAX_CONCURRENCY_N`.
+### Task: poem reconstruction
 
-Request concurrency comes from the capacity report. `--concurrency` remains a
-legacy single-endpoint option. Run any command with `--help` for its complete
-set of controls.
-
-### MCQ and reconstruction runs
-
-`poem-generation` remains the default, so existing commands continue to work.
-For another workflow, pass the same `--task` value to the benchmark, pilot, and
-generation commands. Capacity and pilot artifacts are task-specific and cannot
-be reused across workflows. When `--output-dir` is omitted, MCQ and
-reconstruction default to `data/ashaar_mcq_sft` and
-`data/ashaar_reconstruction_sft` respectively.
-
-#### Running MCQ with one endpoint
-
-For a single endpoint, configure only the unindexed variables in `.env` and
-remove any `GEMMA_ENDPOINT_1..3`, `GEMMA_MODEL_1..3`, and
-`GEMMA_API_KEY_1..3` entries:
-
-```dotenv
-GEMMA_ENDPOINT=https://your-host.example/v1/chat/completions
-GEMMA_MODEL=your-model-name
-GEMMA_API_KEY=replace-with-endpoint-token
+```powershell
+$task = "poem-reconstruction"
+$outputDir = "data/ashaar_reconstruction_sft"
+$capacityDir = "data/gemma_capacity_poem_reconstruction"
 ```
 
-Then run MCQ generation directly; single-endpoint runs do not require capacity
-or pilot artifacts:
+After choosing one block, follow exactly one endpoint-mode sequence below.
+
+| Endpoint mode | Run benchmark? | Run pilot? | Generation gate arguments |
+| --- | --- | --- | --- |
+| One endpoint | No | No | `--concurrency N` |
+| Three endpoints, standard safeguards | Yes | Yes | `--capacity-report`, `--pilot-report`, and `--pilot-review` |
+| Three endpoints, safeguards skipped | No | No | `--skip-pilot-review` |
+
+### Using one API endpoint
+
+After configuring the unindexed `.env` variables, run generation directly.
+Do not pass capacity or pilot reports, and do not pass `--skip-pilot-review`:
 
 ```powershell
 uv run ai-poet-generate-sft `
   --input data/ashaar_classic_moroccan.parquet `
-  --task mcq `
-  --output-dir data/ashaar_mcq_sft `
+  --task $task `
+  --output-dir $outputDir `
   --concurrency 32 `
-  --max-couplets 24 `
-  --insecure
+  --max-couplets 24
 ```
 
-#### Running reconstruction with one endpoint
+Choose `--concurrency` within the single endpoint's tested capacity.
 
-Using the same unindexed `.env` configuration:
+### Using three API endpoints with benchmark and pilot reports
+
+This is the safeguarded production sequence. Do not add
+`--skip-pilot-review` to any command.
+
+1. Benchmark the three endpoints. The resumable benchmark tests each endpoint
+   separately and all three together, then writes
+   `endpoint_capacity.json` when its certification gates pass.
+
+   ```powershell
+   uv run ai-poet-benchmark-endpoints `
+     --input data/ashaar_classic_moroccan.parquet `
+     --task $task `
+     --output-dir $capacityDir
+   ```
+
+2. Run the deterministic pilot using that capacity report. Accepted pilot
+   records are written to the final output checkpoint and reused later.
+
+   ```powershell
+   uv run ai-poet-pilot-sft `
+     --input data/ashaar_classic_moroccan.parquet `
+     --task $task `
+     --output-dir $outputDir `
+     --capacity-report "$capacityDir/endpoint_capacity.json"
+   ```
+
+3. Open `$outputDir/pilot_review.json`, inspect the 30 selected records, set
+   each accepted record's `approved` value to `true`, and add notes where
+   useful. The pilot must have reached at least 98% success, no more than 25%
+   repaired records, and zero truncations.
+
+4. Start or resume full generation with all three artifacts.
+
+   ```powershell
+   uv run ai-poet-generate-sft `
+     --input data/ashaar_classic_moroccan.parquet `
+     --task $task `
+     --output-dir $outputDir `
+     --capacity-report "$capacityDir/endpoint_capacity.json" `
+     --pilot-report "$outputDir/pilot_report.json" `
+     --pilot-review "$outputDir/pilot_review.json" `
+     --max-couplets 24
+   ```
+
+The benchmark defaults to a 30-second warmup and a five-minute measurement at
+each concurrency level. Shorter values are useful for development but are not
+representative production evidence. Full-run concurrency comes from the
+certified capacity report; `--concurrency` does not control the three-endpoint
+pool.
+
+### Using three API endpoints with `--skip-pilot-review`
+
+Use this route only when you deliberately want to bypass the benchmark
+capacity report, automated pilot report, and human pilot review. Despite its
+name, `--skip-pilot-review` skips all three gates, so neither the benchmark nor
+pilot command is needed:
 
 ```powershell
 uv run ai-poet-generate-sft `
   --input data/ashaar_classic_moroccan.parquet `
-  --task poem-reconstruction `
-  --output-dir data/ashaar_reconstruction_sft `
-  --concurrency 32 `
-  --max-couplets 24 `
-  --insecure
+  --task $task `
+  --output-dir $outputDir `
+  --skip-pilot-review `
+  --max-couplets 24
 ```
 
-Choose `--concurrency` within the endpoint's tested capacity. Omit `--insecure`
-when its TLS certificate is trusted. For a small inspection run, add
-`--limit 10 --trace` to either command.
+This command prints a warning and uses each endpoint's
+`GEMMA_MAX_CONCURRENCY_N` value. Omit `--capacity-report`, `--pilot-report`,
+and `--pilot-review`; also omit `--concurrency`, which does not control the
+three-endpoint pool.
 
-MCQ and reconstruction always send the complete selected poem. They fail
-before contacting Gemma if a selected poem exceeds `--max-source-chars`; they
-never substitute a summary for the required poem text.
-
-For MCQ, `--limit` counts source poems rather than output records. Each selected
-poem produces a meter record and, when available, a theme record and a title
-record. These records are checkpointed independently.
+For a small inspection run, add `--limit 10 --trace` to the generation
+command. MCQ and reconstruction always send the complete selected poem and
+fail before contacting Gemma if it exceeds `--max-source-chars`. For MCQ,
+`--limit` counts source poems rather than output records; each selected poem
+produces a meter record and, when available, theme and title records.
 
 ## Resume and failure handling
 
