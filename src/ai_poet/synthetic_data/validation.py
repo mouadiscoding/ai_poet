@@ -49,7 +49,7 @@ REASONING_META_PHRASES = (
 )
 
 QCM_KEYS = frozenset({"question", "choices", "reasoning", "correct_answer"})
-QCM_CHOICE_LETTERS = ("A", "B", "C", "D")
+QCM_CHOICE_LETTERS = ("ا", "ب", "ج", "د")
 QCM_MIN_REASONING_CHARS = 150
 QCM_MIN_CHOICE_CHARS = 15
 QCM_GENERIC_REASONING_PHRASES = (
@@ -308,7 +308,7 @@ def extract_qcm(value: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("QCM question must be a non-empty string")
     choices = value["choices"]
     if not isinstance(choices, dict) or set(choices) != set(QCM_CHOICE_LETTERS):
-        raise ValueError("QCM choices must be a dict with exactly keys A, B, C, and D")
+        raise ValueError("QCM choices must be a dict with exactly keys ا, ب, ج, د")
     cleaned_choices: dict[str, str] = {}
     for letter in QCM_CHOICE_LETTERS:
         choice = choices[letter]
@@ -320,7 +320,7 @@ def extract_qcm(value: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("QCM reasoning must be a non-empty string")
     correct_answer = value["correct_answer"]
     if correct_answer not in QCM_CHOICE_LETTERS:
-        raise ValueError("QCM correct_answer must be one of A, B, C, D")
+        raise ValueError("QCM correct_answer must be one of ا, ب, ج, د")
     return {
         "question": question.strip(),
         "choices": cleaned_choices,
@@ -364,12 +364,8 @@ def qcm_contract_errors(
 
     # The reasoning must reference the question or the choices or the poem.
     reasoning = qcm["reasoning"].casefold()
-    if not any(
-        letter in reasoning for letter in ("أ", "ب", "ج", "د", "a", "b", "c", "d")
-    ):
-        errors.append(
-            "reasoning does not reference any choice letter (أ/ب/ج/د or A/B/C/D)"
-        )
+    if not any(letter in reasoning for letter in QCM_CHOICE_LETTERS):
+        errors.append("reasoning does not reference any choice letter (ا/ب/ج/د)")
 
     # The reasoning must not be a generic statement.
     found_generic = [

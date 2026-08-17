@@ -156,12 +156,12 @@ class ValidationTests(unittest.TestCase):
         qcm = extract_qcm(value)
         self.assertEqual(qcm["question"], value["question"])
         self.assertEqual(qcm["choices"], value["choices"])
-        self.assertEqual(qcm["correct_answer"], "B")
+        self.assertEqual(qcm["correct_answer"], "ب")
         self.assertEqual(qcm_contract_errors(qcm, poem=poem.poem_text), [])
 
     def test_qcm_rejects_wrong_choice_letters(self) -> None:
         value = valid_qcm_value(make_poem())
-        del value["choices"]["D"]
+        del value["choices"]["د"]
         with self.assertRaises(ValueError):
             extract_qcm(value)
 
@@ -174,7 +174,7 @@ class ValidationTests(unittest.TestCase):
     def test_qcm_rejects_generic_reasoning(self) -> None:
         poem = make_poem()
         value = valid_qcm_value(poem)
-        value["reasoning"] = "الإجابة B صحيحة لأن النص يتحدث عن ذلك."
+        value["reasoning"] = "الإجابة ب صحيحة لأن النص يتحدث عن ذلك."
         qcm = extract_qcm(value)
         errors = qcm_contract_errors(qcm, poem=poem.poem_text)
         self.assertIn("reasoning uses a generic statement", str(errors))
@@ -187,9 +187,9 @@ class ValidationTests(unittest.TestCase):
         self.assertIn("السؤال:", response)
         self.assertIn("الخيارات:", response)
         self.assertIn("الاستدلال:", response)
-        self.assertIn("الإجابة الصحيحة: B", response)
+        self.assertIn("الإجابة الصحيحة: ب", response)
         self.assertIn(qcm["question"], response)
-        for letter in ("A", "B", "C", "D"):
+        for letter in ("ا", "ب", "ج", "د"):
             self.assertIn(qcm["choices"][letter], response)
 
     def test_parses_strict_field_verdict(self) -> None:

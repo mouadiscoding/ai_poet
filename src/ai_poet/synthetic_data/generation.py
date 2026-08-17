@@ -293,7 +293,7 @@ def generate_one(
                 "question_present": qcm["question"] in response,
                 "all_choices_present": all(
                     qcm["choices"][letter] in response
-                    for letter in ("A", "B", "C", "D")
+                    for letter in ("ا", "ب", "ج", "د")
                 ),
                 "correct_answer_present": qcm["correct_answer"] in response,
             },
