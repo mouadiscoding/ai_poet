@@ -14,6 +14,7 @@ class PoemRecord:
     source_urls: tuple[str, ...]
     poet_name: str
     poem_title: str | None
+    poem_theme: str | None
     meter_id: int
     meter_name: str
     verses: tuple[str, ...]

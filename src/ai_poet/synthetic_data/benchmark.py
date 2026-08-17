@@ -37,9 +37,10 @@ from .tasks.base import (
     get_task_workflow,
 )
 from .tasks.mcq import (
+    MCQWorkItem,
     build_generation_messages as build_mcq_messages,
     build_validation_messages as build_mcq_validation_messages,
-    question_domain,
+    build_work_items as build_mcq_work_items,
 )
 from .tasks.reconstruction import (
     build_generation_messages as build_reconstruction_messages,
@@ -232,10 +233,10 @@ def _build_poem_generation_fixture_bank(
     return fixtures, probes
 
 
-def _example_mcq_candidate() -> dict[str, Any]:
-    answers = ["يرمز الليل إلى الشدة", "يدل الليل على الفرح", "يصف رحلة بحرية", "يمدح مدينة"]
+def _example_mcq_candidate(item: MCQWorkItem) -> dict[str, Any]:
+    answers = [item.ground_truth, "إجابة بديلة أولى", "إجابة بديلة ثانية", "إجابة بديلة ثالثة"]
     return {
-        "question": "ما الدلالة الأقرب لصورة الليل في سياق القصيدة؟",
+        "question": item.prompt.question,
         "correct_answer": answers[0],
         "distractors": answers[1:],
         "reasoning": {
@@ -275,11 +276,13 @@ def _build_simple_task_fixture_bank(
     task_type: str,
 ) -> tuple[list[BenchmarkFixture], list[BenchmarkFixture]]:
     selected = _stable_poem_choices(poems)
+    mcq_items = build_mcq_work_items(selected) if task_type == TASK_MCQ else []
     fixtures: list[BenchmarkFixture] = []
     for index in range(40):
         poem = selected[index % len(selected)]
         if task_type == TASK_MCQ:
-            messages = build_mcq_messages(poem, question_domain(poem.sample_id)[1])
+            item = mcq_items[index % len(mcq_items)]
+            messages = build_mcq_messages(item)
             kind = "mcq_generation"
         else:
             messages = build_reconstruction_messages(poem, corruption_count(poem))
@@ -304,10 +307,10 @@ def _build_simple_task_fixture_bank(
     for index in range(40):
         poem = selected[index % len(selected)]
         if task_type == TASK_MCQ:
+            item = mcq_items[index % len(mcq_items)]
             messages = build_mcq_validation_messages(
-                poem,
-                question_domain(poem.sample_id)[1],
-                _example_mcq_candidate(),
+                item,
+                _example_mcq_candidate(item),
             )
             kind = "mcq_validation"
         else:

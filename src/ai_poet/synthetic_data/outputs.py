@@ -60,6 +60,7 @@ def write_outputs(
     excluded_long_poems: int = 0,
     task_type: str = TASK_POEM_GENERATION,
     task_version: int = TEMPLATE_VERSION,
+    ordered_work_ids: Sequence[str] | None = None,
 ) -> None:
     """Materialize generated records, failures, and a run manifest.
 
@@ -82,13 +83,20 @@ def write_outputs(
         trace_run_id: Optional audit run identifier recorded in the manifest.
         max_couplets: Optional poem-size selection cap used for this run.
         excluded_long_poems: Number of poems removed by that cap.
+        ordered_work_ids: Optional generation-unit order when a workflow emits
+            more than one record per source poem.
 
     Raises:
         OSError: If the output directory or any output file cannot be written.
         TypeError: If records or manifest values cannot be serialized.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
-    ordered = [successes[poem.sample_id] for poem in poems if poem.sample_id in successes]
+    work_ids = (
+        list(ordered_work_ids)
+        if ordered_work_ids is not None
+        else [poem.sample_id for poem in poems]
+    )
+    ordered = [successes[work_id] for work_id in work_ids if work_id in successes]
     write_jsonl(output_dir / "ashaar_sft.jsonl", ordered)
     if ordered:
         pq.write_table(pa.Table.from_pylist(ordered), output_dir / "ashaar_sft.parquet")
@@ -106,9 +114,13 @@ def write_outputs(
     manifest = {
         "task_type": task_type,
         "task_version": task_version,
-        "complete": len(ordered) == len(poems) and not failure_records,
+        "complete": len(ordered) == len(work_ids) and not failure_records,
         "source_poems": len(poems),
-        "generated_poems": len(ordered),
+        "target_records": len(work_ids),
+        "generated_records": len(ordered),
+        "generated_poems": len(
+            {str(record.get("sample_id")) for record in ordered}
+        ),
         "unresolved_failures": len(failure_records),
         "failure_categories": dict(
             Counter(record["category"] for record in failure_records)
@@ -163,11 +175,18 @@ def write_outputs(
                 if "template_id" in record
             )
         ),
-        "question_domains": dict(
+        "metadata_fields": dict(
             Counter(
-                record["question_domain"]
+                record["metadata_field"]
                 for record in ordered
-                if "question_domain" in record
+                if "metadata_field" in record
+            )
+        ),
+        "mcq_prompts": dict(
+            Counter(
+                record["prompt_id"]
+                for record in ordered
+                if "prompt_id" in record
             )
         ),
         "corruption_counts": dict(

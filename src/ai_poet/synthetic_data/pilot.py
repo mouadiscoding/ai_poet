@@ -25,7 +25,7 @@ from .tasks.base import (
     TASK_POEM_GENERATION,
     get_task_workflow,
 )
-from .tasks.mcq import QUESTION_DOMAINS
+from .tasks.mcq import MCQ_TEMPLATES
 
 
 PILOT_QUOTAS = {
@@ -133,11 +133,11 @@ def _review_records(
                 [
                     sample_id
                     for sample_id, record in successes.items()
-                    if record.get("question_domain") == domain_id
+                    if record.get("metadata_field") == template.metadata_field
                 ],
-                6,
+                10,
             )
-            for domain_id, _label in QUESTION_DOMAINS
+            for template in MCQ_TEMPLATES
         ]
     else:
         review_groups = [
@@ -243,7 +243,9 @@ def run_pilot(settings: PilotSettings) -> int:
     successes, failures = load_checkpoint(
         settings.output_dir / "generation_checkpoint.jsonl"
     )
-    selected_ids = {poem.sample_id for poem in selected}
+    workflow = get_task_workflow(settings.task_type)
+    work_items = workflow.expand_work_items(selected)
+    selected_ids = {workflow.work_item_id(item) for item in work_items}
     successes = {
         sample_id: record
         for sample_id, record in successes.items()
@@ -264,16 +266,18 @@ def run_pilot(settings: PilotSettings) -> int:
         for record in successes.values()
     )
     success_count = len(successes)
+    target_count = len(work_items)
+    repaired_maximum = target_count // 4
     automatic_gates = {
         "success_rate": {
-            "value": success_count / 300,
+            "value": success_count / target_count,
             "minimum": 0.98,
-            "passed": success_count >= 294,
+            "passed": success_count >= target_count * 0.98,
         },
         "repaired_samples": {
             "value": repaired,
-            "maximum": 75,
-            "passed": repaired <= 75,
+            "maximum": repaired_maximum,
+            "passed": repaired <= repaired_maximum,
         },
         "truncated_completions": {
             "value": truncations,
@@ -302,8 +306,13 @@ def run_pilot(settings: PilotSettings) -> int:
         "capacity_report_fingerprint": capacity.report_fingerprint,
         "content_fingerprint": content_fingerprint,
         "selected_samples": 300,
-        "successful_samples": success_count,
+        "selected_records": target_count,
+        "successful_records": success_count,
+        "successful_samples": len(
+            {record.get("sample_id") for record in successes.values()}
+        ),
         "failed_samples": len(failures),
+        "failed_records": len(failures),
         "strata": selected_groups,
         "automatic_gates": automatic_gates,
         "endpoint_ids": sorted(
@@ -318,9 +327,11 @@ def run_pilot(settings: PilotSettings) -> int:
             "validated_samples_per_hour": success_count / elapsed_seconds * 3600,
             "validated_couplets_per_hour": (
                 sum(
-                    poem.couplet_count
-                    for poem in selected
-                    if poem.sample_id in successes
+                    item.poem.couplet_count
+                    if hasattr(item, "poem")
+                    else item.couplet_count
+                    for item in work_items
+                    if workflow.work_item_id(item) in successes
                 )
                 / elapsed_seconds
                 * 3600

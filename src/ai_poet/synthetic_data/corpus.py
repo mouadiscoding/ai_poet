@@ -16,7 +16,8 @@ def _metadata_score(row: dict[str, Any], selected_meter: int) -> tuple[int, int]
     """Score a duplicate source row for selection as canonical metadata.
 
     Rows using the majority meter receive highest priority. Within that group,
-    rows are ranked by how many of title, poet name, and poem URL are populated.
+    rows are ranked by how many of title, theme, poet name, and poem URL are
+    populated.
     Returning a tuple lets Python compare these criteria lexicographically.
 
     Args:
@@ -29,7 +30,10 @@ def _metadata_score(row: dict[str, Any], selected_meter: int) -> tuple[int, int]
     """
     return (
         int(row["poem_meter"] == selected_meter),
-        sum(bool(row.get(key)) for key in ("poem_title", "poet_name", "poem_url")),
+        sum(
+            bool(row.get(key))
+            for key in ("poem_title", "poem_theme", "poet_name", "poem_url")
+        ),
     )
 
 
@@ -45,8 +49,9 @@ def load_poems(path: Path) -> list[PoemRecord]:
     sorted by their first source-row position to preserve source order.
 
     Args:
-        path: Parquet dataset containing ``poem_title``, ``poem_meter``,
-            ``poem_verses``, ``poem_url``, and ``poet_name`` columns.
+        path: Parquet dataset containing ``poem_title``, ``poem_theme``,
+            ``poem_meter``, ``poem_verses``, ``poem_url``, and ``poet_name``
+            columns.
 
     Returns:
         One immutable :class:`PoemRecord` per distinct verse sequence.
@@ -59,6 +64,7 @@ def load_poems(path: Path) -> list[PoemRecord]:
     """
     columns = [
         "poem_title",
+        "poem_theme",
         "poem_meter",
         "poem_verses",
         "poem_url",
@@ -102,6 +108,7 @@ def load_poems(path: Path) -> list[PoemRecord]:
                 source_urls=urls,
                 poet_name=str(canonical.get("poet_name") or ""),
                 poem_title=canonical.get("poem_title"),
+                poem_theme=canonical.get("poem_theme"),
                 meter_id=selected_meter,
                 meter_name=meter_name(selected_meter),
                 verses=verses,

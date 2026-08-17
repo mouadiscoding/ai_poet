@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 
 TASK_POEM_GENERATION = "poem-generation"
@@ -23,6 +23,14 @@ DEFAULT_OUTPUT_DIRS = {
 }
 
 
+def _one_work_item_per_poem(poems: Sequence[Any]) -> list[Any]:
+    return list(poems)
+
+
+def _sample_id(work_item: Any) -> str:
+    return str(work_item.sample_id)
+
+
 @dataclass(frozen=True)
 class TaskWorkflow:
     """Behavior owned by one SFT task while the runner stays task-neutral."""
@@ -36,6 +44,8 @@ class TaskWorkflow:
     checkpoint_stages: tuple[str, ...]
     benchmark_profile: str
     pilot_profile: str
+    expand_work_items: Callable[[Sequence[Any]], list[Any]] = _one_work_item_per_poem
+    work_item_id: Callable[[Any], str] = _sample_id
 
 
 def default_output_dir(task_type: str) -> Path:

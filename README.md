@@ -5,8 +5,10 @@ This project builds Arabic supervised fine-tuning datasets from
 
 - `poem-generation` reverse-constructs a writing instruction and editorial
   worklog, then appends the trusted source poem.
-- `mcq` creates one poem-grounded question with four choices, detailed answer
-  analysis, and exactly one correct answer.
+- `mcq` applies meter, theme, and title question templates to each poem. Each
+  template has multiple uniformly selected question phrasings; the stored
+  metadata is supplied as the exact ground-truth answer, and a template is
+  skipped when its metadata is absent.
 - `poem-reconstruction` creates localized corruptions, explains their repair,
   and lets Python append the trusted original poem.
 
@@ -173,6 +175,10 @@ MCQ and reconstruction always send the complete selected poem. They fail
 before contacting Gemma if a selected poem exceeds `--max-source-chars`; they
 never substitute a summary for the required poem text.
 
+For MCQ, `--limit` counts source poems rather than output records. Each selected
+poem produces a meter record and, when available, a theme record and a title
+record. These records are checkpointed independently.
+
 ## Resume and failure handling
 
 Accepted stages are appended immediately to the version-3
@@ -233,11 +239,12 @@ Each training record includes `task_type`, `task_version`, a task-qualified
 failover counts, meter ID and name, couplet count, generated `instruction`,
 composed `response`, OpenAI-style `messages`, deterministic `sft_split`, and
 quality flags. Poem-generation records retain their concrete template fields;
-MCQ records add the question domain, choices, and correct label; reconstruction
-records add the corrupted poem and corruption count. Exact
-duplicate poem texts share one record and retain all source row indices and
-URLs. Splits are assigned from the poem hash using 98% train, 1% validation,
-and 1% test buckets.
+MCQ records add the metadata field, selected prompt ID, trusted ground-truth
+answer, question, choices, and correct label; reconstruction records add the
+corrupted poem and corruption count. Exact duplicate poem texts share one canonical
+source poem and retain all source row indices and URLs. MCQ can emit up to
+three records from that canonical poem. Splits are assigned from the poem hash
+using 98% train, 1% validation, and 1% test buckets.
 
 Full prompts and raw model responses are deliberately excluded from
 `ashaar_sft.jsonl` and `ashaar_sft.parquet`. Keeping them in the separate trace

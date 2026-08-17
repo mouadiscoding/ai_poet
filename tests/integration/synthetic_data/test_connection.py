@@ -61,6 +61,7 @@ class GemmaConnectionTests(unittest.TestCase):
             source_urls=("https://example.test/poem",),
             poet_name="test poet",
             poem_title="test poem",
+            poem_theme="test theme",
             meter_id=1,
             meter_name="test meter",
             verses=("first half", "second half"),

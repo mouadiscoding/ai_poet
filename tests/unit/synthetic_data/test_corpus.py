@@ -38,6 +38,7 @@ class CorpusTests(unittest.TestCase):
         rows = [
             {
                 "poem_title": None,
+                "poem_theme": None,
                 "poem_meter": 0,
                 "poem_verses": verses,
                 "poem_url": "https://example.test/a",
@@ -45,6 +46,7 @@ class CorpusTests(unittest.TestCase):
             },
             {
                 "poem_title": "عنوان",
+                "poem_theme": "حكمة",
                 "poem_meter": 10,
                 "poem_verses": verses,
                 "poem_url": "https://example.test/b",
@@ -52,6 +54,7 @@ class CorpusTests(unittest.TestCase):
             },
             {
                 "poem_title": "عنوان",
+                "poem_theme": "حكمة",
                 "poem_meter": 10,
                 "poem_verses": verses,
                 "poem_url": "https://example.test/c",
@@ -68,5 +71,6 @@ class CorpusTests(unittest.TestCase):
             remove_test_files(path.name)
         self.assertEqual(len(poems), 1)
         self.assertEqual(poems[0].meter_name, "المديد")
+        self.assertEqual(poems[0].poem_theme, "حكمة")
         self.assertTrue(poems[0].metadata_conflict)
         self.assertEqual(len(poems[0].source_urls), 3)

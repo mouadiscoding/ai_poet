@@ -21,9 +21,13 @@ copying errors cannot corrupt the SFT answer.
 Two additional workflows use the same corpus, endpoint pool, retries, tracing,
 checkpointing, splits, and exporters:
 
-- `mcq` generates one question in a deterministic poem-grounded domain, one
-  correct answer, three distractors, and an explicit assessment of every
-  option. Python shuffles and labels the four choices reproducibly.
+- `mcq` applies templates for `poem_meter`, `poem_theme`, and `poem_title`.
+  Each template contains multiple Arabic question phrasings, one of which is
+  chosen uniformly with a deterministic per-poem seed. The stored metadata
+  value is supplied to Gemma as ground truth and enforced by Python as the
+  exact correct answer. Gemma generates three distractors and an explicit
+  assessment of every option; Python shuffles and labels the choices
+  reproducibly. Templates with absent or blank metadata are skipped.
 - `poem-reconstruction` asks Gemma for a complete structurally preserved
   corrupted poem and detailed local repair records. Python validates every
   one-to-three-word replacement, canonicalizes unambiguous zero-based indices
@@ -62,8 +66,9 @@ Most semantic metadata is sparse:
 - `poem_theme` is absent for 49,699 source rows.
 - `poem_language_type` is `فصيح` for 49,552 rows and absent for the rest.
 
-Consequently, the model must infer most semantic constraints from the poem
-itself rather than relying on titles or theme labels.
+Consequently, poem-generation must infer most semantic constraints from the
+poem itself. MCQ title and theme templates instead run only where those trusted
+labels exist.
 
 ## Meter mapping
 
@@ -390,13 +395,14 @@ The pipeline writes the same logical records to `ashaar_sft.jsonl` and
 | Field | Meaning |
 | --- | --- |
 | `sample_id` | SHA-256 of the exact source hemistich sequence |
-| `record_id` | Task-qualified record identifier, `<task_type>:<sample_id>` |
+| `record_id` | Task-qualified record identifier; MCQ also appends its metadata field |
 | `task_type` | `poem-generation`, `mcq`, or `poem-reconstruction` |
 | `task_version` | Version of the selected task contract |
 | `source_row_indices` | All original rows represented by the record |
 | `source_urls` | All retained source URLs |
 | `poet_name` | Canonical source poet name for provenance |
 | `poem_title` | Canonical title when available |
+| `poem_theme` | Canonical theme when available |
 | `meter_id` | Original numeric base-meter class |
 | `meter_name` | Decoded Arabic base-meter name |
 | `couplet_count` | Number of hemistich pairs |
@@ -419,9 +425,12 @@ The pipeline writes the same logical records to `ashaar_sft.jsonl` and
 | `truncated_completions` | Responses whose endpoint finish reason was `length` |
 
 Poem-generation retains `template_id`, `template_version`, and its
-instruction/reasoning attempt counters. MCQ adds `question_domain`, `question`,
-four labeled `choices`, and `correct_choice_label`. Reconstruction adds
-`corrupted_poem` and the reproducible `corruption_count`.
+instruction/reasoning attempt counters. MCQ adds `metadata_field`, `prompt_id`,
+`ground_truth_answer`, `question`, four labeled `choices`, and
+`correct_choice_label`. Its record ID is
+`mcq:<sample_id>:<metadata_field>`, allowing each applicable template to be
+checkpointed independently. Reconstruction adds `corrupted_poem` and the
+reproducible `corruption_count`.
 
 `messages` contains:
 
@@ -598,8 +607,9 @@ It covers:
 - Oversized-poem summaries and synthesis.
 - Template-version-aware checkpoint reuse.
 - JSONL and Parquet round trips.
-- Deterministic MCQ domains and choice ordering, unique-answer validation, and
-  exact final-answer formatting.
+- Complete MCQ metadata-template expansion, missing-metadata skips, uniform
+  prompt selection, ground-truth enforcement, deterministic choice ordering,
+  unique-answer validation, and exact final-answer formatting.
 - Stable reconstruction severity, localized diff enforcement, reasoning
   coverage, index and Arabic-diacritic canonicalization, and byte-exact
   source-poem appending.
@@ -611,9 +621,10 @@ Before a full production run is accepted, verify that:
 2. The manifest reports `complete: true`.
 3. `generated_poems` equals the selected eligible count (45,161 with the
    current corpus and default 24-couplet cap).
-4. `unresolved_failures` is zero.
-5. The JSONL and Parquet files both load successfully.
-6. Oversized records are filtered or retained according to the downstream
+4. For MCQ, `generated_records` equals `target_records`.
+5. `unresolved_failures` is zero.
+6. The JSONL and Parquet files both load successfully.
+7. Oversized records are filtered or retained according to the downstream
    trainer's real context limit.
 
 ## Known limitations

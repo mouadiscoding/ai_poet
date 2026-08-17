@@ -22,6 +22,8 @@ def remove_test_files(*names: str) -> None:
 def make_poem(
     *,
     meter_id: int = 1,
+    poem_title: str | None = "عنوان الاختبار",
+    poem_theme: str | None = "الصبر والرجاء",
     verses: tuple[str, ...] = (
         "يا قلب صبرا على الأيام",
         "فالليل يعقبه الضياء",
@@ -34,7 +36,8 @@ def make_poem(
         source_row_indices=(7,),
         source_urls=("https://example.test/poem/7",),
         poet_name="شاعر الاختبار",
-        poem_title="عنوان الاختبار",
+        poem_title=poem_title,
+        poem_theme=poem_theme,
         meter_id=meter_id,
         meter_name=meter_name(meter_id),
         verses=verses,

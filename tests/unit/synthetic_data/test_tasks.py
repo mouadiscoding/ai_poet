@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 import json
 from pathlib import Path
 import unittest
@@ -17,10 +18,12 @@ from ai_poet.synthetic_data.tasks.base import (
     get_task_workflow,
 )
 from ai_poet.synthetic_data.tasks.mcq import (
+    MCQ_TEMPLATES,
+    build_generation_messages as build_mcq_messages,
+    build_work_items as build_mcq_work_items,
     extract_candidate as extract_mcq_candidate,
     generate_one as generate_mcq,
     order_choices,
-    question_domain,
 )
 from ai_poet.synthetic_data.tasks.reconstruction import (
     build_generation_messages as build_reconstruction_messages,
@@ -38,15 +41,17 @@ from tests.synthetic_data_helpers import (
 )
 
 
-def valid_mcq_candidate() -> dict[str, object]:
+def valid_mcq_candidate(item=None) -> dict[str, object]:
+    if item is None:
+        item = build_mcq_work_items([make_poem()])[0]
     answers = [
-        "التدرج من الشدة إلى الأمل",
+        item.ground_truth,
         "الاستسلام الكامل لليأس",
         "وصف رحلة في البحر",
         "الفخر بالنسب والقبيلة",
     ]
     return {
-        "question": "ما المسار الدلالي الأوضح الذي تنتظم فيه أبيات القصيدة؟",
+        "question": item.prompt.question,
         "correct_answer": answers[0],
         "distractors": answers[1:],
         "reasoning": {
@@ -109,7 +114,7 @@ class TaskRegistryTests(unittest.TestCase):
             get_task_workflow(TASK_POEM_GENERATION).task_type,
             TASK_POEM_GENERATION,
         )
-        self.assertEqual(get_task_workflow(TASK_MCQ).version, 1)
+        self.assertEqual(get_task_workflow(TASK_MCQ).version, 3)
         self.assertEqual(get_task_workflow(TASK_POEM_RECONSTRUCTION).version, 2)
         self.assertEqual(default_output_dir(TASK_MCQ), Path("data/ashaar_mcq_sft"))
 
@@ -160,9 +165,9 @@ class TaskRegistryTests(unittest.TestCase):
         def fake_generate(source_poem, _client, _settings, **_kwargs):
             return {
                 "sample_id": source_poem.sample_id,
-                "record_id": f"mcq:{source_poem.sample_id}",
+                "record_id": source_poem.work_id,
                 "task_type": TASK_MCQ,
-                "task_version": 1,
+                "task_version": 3,
                 "instruction": "تعليمات السؤال",
                 "response": "تحليل\n\nالإجابة الصحيحة: أ) جواب",
                 "messages": [],
@@ -210,20 +215,88 @@ class TaskRegistryTests(unittest.TestCase):
             (output_dir / "manifest.json").read_text("utf-8")
         )
         self.assertEqual(manifest["task_type"], TASK_MCQ)
+        self.assertEqual(manifest["target_records"], 3)
+        self.assertEqual(manifest["generated_records"], 3)
         records = (output_dir / "ashaar_sft.jsonl").read_text("utf-8")
         self.assertIn(f'"task_type": "{TASK_MCQ}"', records)
 
 
 class McqWorkflowTests(unittest.TestCase):
-    def test_domain_and_choice_order_are_deterministic(self) -> None:
-        poem = make_poem()
-        candidate = extract_mcq_candidate(valid_mcq_candidate())
-        self.assertEqual(question_domain(poem.sample_id), question_domain(poem.sample_id))
-        self.assertEqual(
-            order_choices(poem.sample_id, candidate),
-            order_choices(poem.sample_id, candidate),
+    def test_all_templates_apply_and_missing_metadata_is_skipped(self) -> None:
+        complete = build_mcq_work_items([make_poem()])
+        sparse = build_mcq_work_items(
+            [make_poem(poem_title=None, poem_theme="  ")]
         )
-        self.assertEqual(len(order_choices(poem.sample_id, candidate)), 4)
+        self.assertEqual(
+            [item.template.metadata_field for item in complete],
+            [template.metadata_field for template in MCQ_TEMPLATES],
+        )
+        self.assertEqual(
+            [item.ground_truth for item in complete],
+            [
+                complete[0].poem.meter_name,
+                complete[0].poem.poem_theme,
+                complete[0].poem.poem_title,
+            ],
+        )
+        self.assertEqual(
+            [item.template.metadata_field for item in sparse],
+            ["poem_meter"],
+        )
+        for template in MCQ_TEMPLATES:
+            self.assertGreater(len(template.prompts), 1)
+            self.assertEqual(
+                len({prompt.prompt_id for prompt in template.prompts}),
+                len(template.prompts),
+            )
+
+    def test_prompt_selection_is_deterministic_and_uniform(self) -> None:
+        base = make_poem()
+        poems = [
+            replace(base, sample_id=f"{index:064x}")
+            for index in range(1_000)
+        ]
+        first = build_mcq_work_items(poems)
+        second = build_mcq_work_items(poems)
+        self.assertEqual(
+            [item.prompt.prompt_id for item in first],
+            [item.prompt.prompt_id for item in second],
+        )
+        for template in MCQ_TEMPLATES:
+            counts = Counter(
+                item.prompt.prompt_id
+                for item in first
+                if item.template.template_id == template.template_id
+            )
+            self.assertEqual(set(counts), {prompt.prompt_id for prompt in template.prompts})
+            self.assertTrue(all(150 <= count <= 250 for count in counts.values()))
+
+    def test_ground_truth_is_in_prompt_and_enforced(self) -> None:
+        item = build_mcq_work_items([make_poem()])[1]
+        prompt = build_mcq_messages(item)[1]["content"]
+        self.assertIn(item.ground_truth, prompt)
+        candidate = valid_mcq_candidate(item)
+        candidate["correct_answer"] = "إجابة مختلقة"
+        with self.assertRaisesRegex(ValueError, "ground truth"):
+            extract_mcq_candidate(
+                candidate,
+                expected_question=item.prompt.question,
+                ground_truth=item.ground_truth,
+            )
+
+    def test_choice_order_is_deterministic(self) -> None:
+        poem = make_poem()
+        item = build_mcq_work_items([poem])[0]
+        candidate = extract_mcq_candidate(
+            valid_mcq_candidate(item),
+            expected_question=item.prompt.question,
+            ground_truth=item.ground_truth,
+        )
+        self.assertEqual(
+            order_choices(item.work_id, candidate),
+            order_choices(item.work_id, candidate),
+        )
+        self.assertEqual(len(order_choices(item.work_id, candidate)), 4)
 
     def test_duplicate_answers_are_rejected(self) -> None:
         candidate = valid_mcq_candidate()
@@ -233,14 +306,18 @@ class McqWorkflowTests(unittest.TestCase):
 
     def test_generation_renders_reasoning_and_exact_final_answer(self) -> None:
         poem = make_poem()
+        item = build_mcq_work_items([poem])[0]
         outputs = [
-            json.dumps(valid_mcq_candidate(), ensure_ascii=False),
+            json.dumps(valid_mcq_candidate(item), ensure_ascii=False),
             json.dumps(valid_verdict(), ensure_ascii=False),
         ]
-        record = generate_mcq(poem, QueueClient(outputs), settings())
+        record = generate_mcq(item, QueueClient(outputs), settings())
         self.assertEqual(record["task_type"], TASK_MCQ)
         self.assertEqual(len(record["choices"]), 4)
         self.assertIn(poem.poem_text, record["instruction"])
+        self.assertEqual(record["ground_truth_answer"], item.ground_truth)
+        self.assertEqual(record["metadata_field"], "poem_meter")
+        self.assertEqual(record["prompt_id"], item.prompt.prompt_id)
         self.assertTrue(record["response"].startswith("التحليل والاستدلال:"))
         correct = next(
             choice
@@ -255,13 +332,14 @@ class McqWorkflowTests(unittest.TestCase):
 
     def test_invalid_mcq_is_repaired_before_export(self) -> None:
         poem = make_poem()
+        item = build_mcq_work_items([poem])[0]
         outputs = [
             "{}",
-            json.dumps(valid_mcq_candidate(), ensure_ascii=False),
+            json.dumps(valid_mcq_candidate(item), ensure_ascii=False),
             json.dumps(valid_verdict(), ensure_ascii=False),
         ]
         client = QueueClient(outputs)
-        record = generate_mcq(poem, client, settings())
+        record = generate_mcq(item, client, settings())
         self.assertEqual(record["generation_attempts"], 2)
         self.assertEqual(record["validation_status"], "passed_after_repair")
         self.assertIn("الجواب السابق غير صالح", client.calls[1][-1]["content"])
