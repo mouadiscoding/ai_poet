@@ -8,6 +8,7 @@ import sys
 
 from .benchmark import BenchmarkSettings, DEFAULT_LEVELS, run_benchmark
 from .config import load_generation_settings
+from .tasks.base import TASK_POEM_GENERATION, TASK_TYPES
 
 
 def _levels(value: str) -> tuple[int, ...]:
@@ -28,7 +29,10 @@ def build_parser() -> ArgumentParser:
         default=Path("data/ashaar_classic_moroccan.parquet"),
     )
     parser.add_argument(
-        "--output-dir", type=Path, default=Path("data/gemma_capacity")
+        "--task", choices=TASK_TYPES, default=TASK_POEM_GENERATION
+    )
+    parser.add_argument(
+        "--output-dir", type=Path
     )
     parser.add_argument("--duration-per-level", type=float, default=300.0)
     parser.add_argument("--warmup-seconds", type=float, default=30.0)
@@ -55,8 +59,16 @@ def main() -> None:
         args = build_parser().parse_args()
         settings = BenchmarkSettings(
             input=args.input,
-            output_dir=args.output_dir,
+            output_dir=(
+                args.output_dir
+                or (
+                    Path("data/gemma_capacity")
+                    if args.task == TASK_POEM_GENERATION
+                    else Path(f"data/gemma_capacity_{args.task.replace('-', '_')}")
+                )
+            ),
             generation=load_generation_settings(args),
+            task_type=args.task,
             duration_per_level=args.duration_per_level,
             warmup_seconds=args.warmup_seconds,
             concurrency_levels=args.concurrency_levels,

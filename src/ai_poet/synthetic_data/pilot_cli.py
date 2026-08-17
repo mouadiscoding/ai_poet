@@ -9,6 +9,11 @@ import sys
 from .config import load_generation_settings
 from .errors import GemmaConnectionError
 from .pilot import PilotSettings, run_pilot
+from .tasks.base import (
+    TASK_POEM_GENERATION,
+    TASK_TYPES,
+    default_output_dir,
+)
 
 
 def build_parser() -> ArgumentParser:
@@ -18,7 +23,10 @@ def build_parser() -> ArgumentParser:
         type=Path,
         default=Path("data/ashaar_classic_moroccan.parquet"),
     )
-    parser.add_argument("--output-dir", type=Path, default=Path("data/ashaar_sft"))
+    parser.add_argument(
+        "--task", choices=TASK_TYPES, default=TASK_POEM_GENERATION
+    )
+    parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--capacity-report", type=Path, required=True)
     parser.add_argument("--per-sample-chunk-cap", type=int, default=4)
     parser.add_argument("--trace", action="store_true")
@@ -43,11 +51,12 @@ def main() -> None:
         code = run_pilot(
             PilotSettings(
                 input=args.input,
-                output_dir=args.output_dir,
+                output_dir=args.output_dir or default_output_dir(args.task),
                 capacity_report=args.capacity_report,
                 generation=load_generation_settings(args),
                 trace=args.trace,
                 per_sample_chunk_cap=args.per_sample_chunk_cap,
+                task_type=args.task,
             )
         )
     except (GemmaConnectionError, OSError, ValueError) as exc:

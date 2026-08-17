@@ -2,9 +2,9 @@
 
 ## Purpose
 
-This document describes the pipeline implemented by the
-[`ai_poet.synthetic_data`](../src/ai_poet/synthetic_data) package. The pipeline
-converts the poems in
+This document describes the task-oriented pipeline implemented by the
+[`ai_poet.synthetic_data`](../src/ai_poet/synthetic_data) package. The default
+`poem-generation` workflow converts the poems in
 `data/ashaar_classic_moroccan.parquet` into supervised fine-tuning examples
 containing:
 
@@ -17,6 +17,22 @@ the subject, meaning progression, imagery, emotional atmosphere, diction, rhyme,
 and other constraints from each source poem. It does not ask Gemma to reproduce
 the final target. The Python code appends the original poem itself so that model
 copying errors cannot corrupt the SFT answer.
+
+Two additional workflows use the same corpus, endpoint pool, retries, tracing,
+checkpointing, splits, and exporters:
+
+- `mcq` generates one question in a deterministic poem-grounded domain, one
+  correct answer, three distractors, and an explicit assessment of every
+  option. Python shuffles and labels the four choices reproducibly.
+- `poem-reconstruction` asks Gemma for a complete structurally preserved
+  corrupted poem and detailed local repair records. Python validates every
+  one-to-three-word replacement and appends the exact source poem; Gemma never
+  emits the complete corrected poem.
+
+All three commands accept `--task poem-generation`, `--task mcq`, or
+`--task poem-reconstruction`. The first remains the default. Each task has its
+own contract version and fingerprints, so capacity reports, pilot artifacts,
+checkpoints, and output directories cannot be mixed.
 
 ## Source corpus findings
 
@@ -373,6 +389,9 @@ The pipeline writes the same logical records to `ashaar_sft.jsonl` and
 | Field | Meaning |
 | --- | --- |
 | `sample_id` | SHA-256 of the exact source hemistich sequence |
+| `record_id` | Task-qualified record identifier, `<task_type>:<sample_id>` |
+| `task_type` | `poem-generation`, `mcq`, or `poem-reconstruction` |
+| `task_version` | Version of the selected task contract |
 | `source_row_indices` | All original rows represented by the record |
 | `source_urls` | All retained source URLs |
 | `poet_name` | Canonical source poet name for provenance |
@@ -398,6 +417,11 @@ The pipeline writes the same logical records to `ashaar_sft.jsonl` and
 | `network_attempts` | Total HTTP attempts associated with the sample |
 | `truncated_completions` | Responses whose endpoint finish reason was `length` |
 
+Poem-generation retains `template_id`, `template_version`, and its
+instruction/reasoning attempt counters. MCQ adds `question_domain`, `question`,
+four labeled `choices`, and `correct_choice_label`. Reconstruction adds
+`corrupted_poem` and the reproducible `corruption_count`.
+
 `messages` contains:
 
 ```json
@@ -415,6 +439,11 @@ The output directory also contains:
 - `pilot_report.json` and `pilot_review.json` for the strict production gate
 - `failures.jsonl`, updated live with `sample_id`, failure `category`, and error
 - `manifest.json`
+
+The manifest records the selected task and refuses cross-task directory reuse.
+The checkpoint format is version 3 and stores generic accepted-stage events;
+legacy version-1 and version-2 poem-generation events are replayed into the
+same stage view.
 
 The manifest records completion status, source SHA-256, template version, model
 and endpoint, decoding and length settings, output counts, split distribution,
@@ -524,6 +553,28 @@ override with:
 uv run ai-poet-generate-sft --help
 ```
 
+### Running MCQ or reconstruction
+
+Use the same task value for capacity certification, the pilot, and the final
+run. For example, the MCQ production sequence is:
+
+```powershell
+uv run ai-poet-benchmark-endpoints --task mcq `
+  --output-dir data/gemma_capacity_mcq
+uv run ai-poet-pilot-sft --task mcq `
+  --capacity-report data/gemma_capacity_mcq/endpoint_capacity.json
+uv run ai-poet-generate-sft --task mcq `
+  --capacity-report data/gemma_capacity_mcq/endpoint_capacity.json `
+  --pilot-report data/ashaar_mcq_sft/pilot_report.json `
+  --pilot-review data/ashaar_mcq_sft/pilot_review.json
+```
+
+Replace `mcq` with `poem-reconstruction` for reconstruction. When no output
+directory is supplied, the two workflows use `data/ashaar_mcq_sft` and
+`data/ashaar_reconstruction_sft`. Both require the complete poem and fail
+preflight if any selected poem exceeds `--max-source-chars`; only the default
+poem-generation workflow may replace an oversized source with chunk summaries.
+
 ## Verification
 
 The automated suite is offline and uses fake API clients:
@@ -546,6 +597,11 @@ It covers:
 - Oversized-poem summaries and synthesis.
 - Template-version-aware checkpoint reuse.
 - JSONL and Parquet round trips.
+- Deterministic MCQ domains and choice ordering, unique-answer validation, and
+  exact final-answer formatting.
+- Stable reconstruction severity, localized diff enforcement, reasoning
+  coverage, and byte-exact source-poem appending.
+- Task-isolated fingerprints, manifests, pilots, and version-3 checkpoints.
 
 Before a full production run is accepted, verify that:
 

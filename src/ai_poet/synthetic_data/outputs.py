@@ -14,6 +14,7 @@ from .config import GenerationSettings
 from .errors import classify_generation_failure
 from .poems import PoemRecord
 from .prompts.templates import TEMPLATE_VERSION
+from .tasks.base import TASK_POEM_GENERATION
 
 
 def write_jsonl(path: Path, records: Iterable[dict[str, Any]]) -> None:
@@ -57,6 +58,8 @@ def write_outputs(
     endpoint_metrics: dict[str, Any] | None = None,
     max_couplets: int | None = None,
     excluded_long_poems: int = 0,
+    task_type: str = TASK_POEM_GENERATION,
+    task_version: int = TEMPLATE_VERSION,
 ) -> None:
     """Materialize generated records, failures, and a run manifest.
 
@@ -92,6 +95,7 @@ def write_outputs(
     failure_records = [
         {
             "sample_id": sample_id,
+            "task_type": task_type,
             "category": classify_generation_failure(error),
             "error": error,
         }
@@ -100,6 +104,8 @@ def write_outputs(
     ]
     write_jsonl(output_dir / "failures.jsonl", failure_records)
     manifest = {
+        "task_type": task_type,
+        "task_version": task_version,
         "complete": len(ordered) == len(poems) and not failure_records,
         "source_poems": len(poems),
         "generated_poems": len(ordered),
@@ -122,7 +128,9 @@ def write_outputs(
             for endpoint in settings.configured_endpoints
         ],
         "source_sha256": source_fingerprint,
-        "template_version": TEMPLATE_VERSION,
+        "template_version": (
+            TEMPLATE_VERSION if task_type == TASK_POEM_GENERATION else None
+        ),
         "generation": {
             "temperature": settings.temperature,
             "top_p": settings.top_p,
@@ -148,12 +156,32 @@ def write_outputs(
             int(record.get("truncated_completions", 0)) for record in ordered
         ),
         "splits": dict(Counter(record["sft_split"] for record in ordered)),
-        "templates": dict(Counter(record["template_id"] for record in ordered)),
+        "templates": dict(
+            Counter(
+                record["template_id"]
+                for record in ordered
+                if "template_id" in record
+            )
+        ),
+        "question_domains": dict(
+            Counter(
+                record["question_domain"]
+                for record in ordered
+                if "question_domain" in record
+            )
+        ),
+        "corruption_counts": dict(
+            Counter(
+                str(record["corruption_count"])
+                for record in ordered
+                if "corruption_count" in record
+            )
+        ),
         "oversized_for_sft": sum(
-            bool(record["oversized_for_sft"]) for record in ordered
+            bool(record.get("oversized_for_sft", False)) for record in ordered
         ),
         "metadata_conflicts": sum(
-            bool(record["metadata_conflict"]) for record in ordered
+            bool(record.get("metadata_conflict", False)) for record in ordered
         ),
     }
     (output_dir / "manifest.json").write_text(

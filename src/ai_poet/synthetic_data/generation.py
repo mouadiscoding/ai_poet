@@ -27,24 +27,23 @@ from .validation import (
     extract_json_object,
     extract_reasoning_chunk,
     instruction_contract_errors,
-    parse_field_verdict,
+)
+from .workflow import (
+    client_provenance as _client_provenance,
+    emit_client_trace as _emit_client_trace,
+    merge_provenance as _merge_provenance,
+    repair_messages as _repair_messages,
+    request_verdict as _request_verdict,
 )
 
 
 REASONING_CHUNK_COUPLETS = 3
-VALIDATOR_FORMAT_ATTEMPTS = 3
 
 TEMPLATE_RATIONALE = (
     "Six concrete prompts vary the order and framing of instruction "
     "reconstruction while every prompt requires all six poetic dimensions. "
     "Verse-level editorial work is generated separately in bounded chunks."
 )
-
-
-def _emit_client_trace(client: Any, event: dict[str, Any]) -> None:
-    tracer = getattr(client, "tracer", None)
-    if tracer is not None:
-        tracer.emit(event)
 
 
 def _bounded_parallel_map(
@@ -134,69 +133,6 @@ def _chunk_analysis(
         f"ملخص المقطع {index}: {summaries[index]}"
         for index in range(1, len(chunks) + 1)
     )
-
-
-def _repair_messages(
-    base_messages: Sequence[dict[str, str]],
-    raw: str,
-    errors: Sequence[str],
-) -> list[dict[str, str]]:
-    """Append one complete rejected answer and actionable repair feedback."""
-    return [
-        *base_messages,
-        {"role": "assistant", "content": raw},
-        {
-            "role": "user",
-            "content": (
-                "الجواب السابق غير صالح للأسباب الآتية:\n- "
-                + "\n- ".join(errors)
-                + "\nأعد كائن JSON مصححًا كاملًا فقط، مع الحفاظ على العقد المطلوب."
-            ),
-        },
-    ]
-
-
-def _request_verdict(
-    client: GemmaClient,
-    messages: Sequence[dict[str, str]],
-    *,
-    max_tokens: int,
-    seed: int,
-    trace_context: dict[str, Any],
-) -> tuple[str, dict[str, Any], int]:
-    """Retry malformed judge output without charging it to candidate repairs."""
-    last_error: Exception | None = None
-    raw = ""
-    for attempt in range(1, VALIDATOR_FORMAT_ATTEMPTS + 1):
-        retry_messages = list(messages)
-        if attempt > 1:
-            retry_messages.extend(
-                [
-                    {"role": "assistant", "content": raw},
-                    {
-                        "role": "user",
-                        "content": (
-                            "أعد كائن JSON واحدًا فقط بالمفتاحين passed وerrors، "
-                            "بلا شرح ولا كائن ثانٍ."
-                        ),
-                    },
-                ]
-            )
-        raw = client.chat(
-            retry_messages,
-            max_tokens=max_tokens,
-            temperature=0.0,
-            seed=seed + attempt - 1,
-            trace_context={
-                **trace_context,
-                "validator_format_attempt": attempt,
-            },
-        )
-        try:
-            return raw, parse_field_verdict(raw), attempt
-        except (ValueError, json.JSONDecodeError) as exc:
-            last_error = exc
-    raise GenerationError(f"validation response remained invalid: {last_error}")
 
 
 def _generate_instruction(
@@ -443,46 +379,6 @@ def _instruction_fingerprint(
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
-def _client_provenance(client: Any, sample_id: str) -> dict[str, Any]:
-    if hasattr(client, "sample_stats"):
-        return client.sample_stats(sample_id)
-    return {
-        "generation_endpoint_ids": ["legacy"],
-        "network_attempts": 0,
-        "endpoint_failover_count": 0,
-        "truncated_completions": 0,
-    }
-
-
-def _merge_provenance(
-    current: dict[str, Any],
-    prior_events: Sequence[dict[str, Any]],
-) -> dict[str, Any]:
-    prior = [
-        event.get("provenance", {})
-        for event in prior_events
-        if isinstance(event.get("provenance"), dict)
-    ]
-    endpoints = set(current.get("generation_endpoint_ids", []))
-    for item in prior:
-        endpoints.update(item.get("generation_endpoint_ids", []))
-    return {
-        "generation_endpoint_ids": sorted(endpoints),
-        "network_attempts": int(current.get("network_attempts", 0))
-        + max((int(item.get("network_attempts", 0)) for item in prior), default=0),
-        "endpoint_failover_count": int(current.get("endpoint_failover_count", 0))
-        + max(
-            (int(item.get("endpoint_failover_count", 0)) for item in prior),
-            default=0,
-        ),
-        "truncated_completions": int(current.get("truncated_completions", 0))
-        + max(
-            (int(item.get("truncated_completions", 0)) for item in prior),
-            default=0,
-        ),
-    }
-
-
 def generate_one(
     poem: PoemRecord,
     client: GemmaClient,
@@ -491,11 +387,13 @@ def generate_one(
     generation_fingerprint: str = "legacy",
     resume_instruction: dict[str, Any] | None = None,
     resume_chunks: dict[int, dict[str, Any]] | None = None,
+    resume_stages: dict[str, dict[str, Any]] | None = None,
     checkpoint_writer: CheckpointWriter | None = None,
     chunk_executor: Executor | None = None,
     chunk_parallelism: int = 1,
 ) -> dict[str, Any]:
     """Generate one SFT record while reusing compatible accepted stages."""
+    del resume_stages  # Generic runner view; legacy arguments remain authoritative.
     resume_chunks = resume_chunks or {}
     effective_capacity = getattr(client, "total_effective_capacity", 1)
     chunk_parallelism = min(
@@ -589,14 +487,20 @@ def generate_one(
     if checkpoint_writer is not None and not instruction_reused:
         checkpoint_writer.append(
             {
-                "event": "instruction_success",
+                "event": "stage_success",
                 "sample_id": poem.sample_id,
-                "generation_fingerprint": generation_fingerprint,
-                "instruction_fingerprint": instruction_fingerprint,
-                "template_id": template.template_id,
-                "instruction": instruction,
-                "instruction_attempts": instruction_attempts,
-                "provenance": _client_provenance(client, poem.sample_id),
+                "task_type": "poem-generation",
+                "task_version": TEMPLATE_VERSION,
+                "stage_name": "instruction",
+                "stage_key": "instruction",
+                "workflow_fingerprint": generation_fingerprint,
+                "payload": {
+                    "instruction_fingerprint": instruction_fingerprint,
+                    "template_id": template.template_id,
+                    "instruction": instruction,
+                    "instruction_attempts": instruction_attempts,
+                    "provenance": _client_provenance(client, poem.sample_id),
+                },
             }
         )
 
@@ -641,16 +545,22 @@ def generate_one(
                 chunk_overview, blocks, attempts = result
                 checkpoint_writer.append(
                     {
-                        "event": "reasoning_chunk_success",
+                        "event": "stage_success",
                         "sample_id": poem.sample_id,
-                        "generation_fingerprint": generation_fingerprint,
-                        "instruction_fingerprint": instruction_fingerprint,
-                        "start_offset": start_offset,
-                        "chunk_end": start_offset + len(chunk_couplets),
-                        "overview": chunk_overview,
-                        "blocks": blocks,
-                        "attempts": attempts,
-                        "provenance": _client_provenance(client, poem.sample_id),
+                        "task_type": "poem-generation",
+                        "task_version": TEMPLATE_VERSION,
+                        "stage_name": "reasoning_chunk",
+                        "stage_key": f"reasoning_chunk:{start_offset}",
+                        "workflow_fingerprint": generation_fingerprint,
+                        "payload": {
+                            "instruction_fingerprint": instruction_fingerprint,
+                            "start_offset": start_offset,
+                            "chunk_end": start_offset + len(chunk_couplets),
+                            "overview": chunk_overview,
+                            "blocks": blocks,
+                            "attempts": attempts,
+                            "provenance": _client_provenance(client, poem.sample_id),
+                        },
                     }
                 )
             return result
@@ -698,6 +608,9 @@ def generate_one(
     )
     record = {
         "sample_id": poem.sample_id,
+        "record_id": f"poem-generation:{poem.sample_id}",
+        "task_type": "poem-generation",
+        "task_version": TEMPLATE_VERSION,
         "source_row_indices": list(poem.source_row_indices),
         "source_urls": list(poem.source_urls),
         "poet_name": poem.poet_name,

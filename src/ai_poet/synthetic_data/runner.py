@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
-import math
+import json
 from pathlib import Path
 from typing import Any
 
@@ -25,15 +25,11 @@ from .client import GemmaClient, GemmaPoolClient
 from .config import RunSettings
 from .corpus import load_poems
 from .errors import GemmaConnectionError, classify_generation_failure
-from .generation import TEMPLATE_RATIONALE, generate_one
+from .generation import generate_one
 from .outputs import append_jsonl, write_jsonl, write_outputs
-from .poems import PoemRecord, split_poem_chunks
-from .prompts.templates import (
-    ALL_FOCUS_REQUIREMENTS,
-    PROMPT_TEMPLATES,
-    TEMPLATE_VERSION,
-)
+from .poems import PoemRecord
 from .runtime_metrics import GenerationProgress, RuntimeMetricsWriter
+from .tasks.base import TASK_POEM_GENERATION, get_task_workflow
 from .tracing import GenerationTracer, PRINT_LOCK
 
 
@@ -47,13 +43,7 @@ def file_sha256(path: Path) -> str:
 
 def estimated_request_work(poem: PoemRecord, run_settings: RunSettings) -> int:
     """Estimate logical calls so shortest-processing-time scheduling is stable."""
-    reasoning_chunks = math.ceil(poem.couplet_count / 3)
-    oversized_chunks = (
-        len(split_poem_chunks(poem.verses, run_settings.generation.chunk_chars))
-        if len(poem.poem_text) > run_settings.generation.max_source_chars
-        else 0
-    )
-    return 2 + 2 * reasoning_chunks + oversized_chunks
+    return get_task_workflow(run_settings.task_type).estimate_work(poem, run_settings)
 
 
 def _normalize_reused_record(record: dict[str, Any]) -> dict[str, Any]:
@@ -63,6 +53,34 @@ def _normalize_reused_record(record: dict[str, Any]) -> dict[str, Any]:
     normalized.setdefault("network_attempts", 0)
     normalized.setdefault("truncated_completions", 0)
     return normalized
+
+
+def _validate_output_task(output_dir: Path, task_type: str) -> None:
+    """Prevent one task from overwriting another task's durable artifacts."""
+    manifest_path = output_dir / "manifest.json"
+    existing: str | None = None
+    if manifest_path.exists():
+        try:
+            manifest = json.loads(manifest_path.read_text("utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"Cannot inspect existing output manifest: {exc}") from exc
+        existing = str(manifest.get("task_type", TASK_POEM_GENERATION))
+    checkpoint_path = output_dir / "generation_checkpoint.jsonl"
+    if existing is None and checkpoint_path.exists():
+        try:
+            with checkpoint_path.open("r", encoding="utf-8") as handle:
+                first = next((line for line in handle if line.strip()), None)
+            if first is not None:
+                event = json.loads(first)
+                existing = str(event.get("task_type", TASK_POEM_GENERATION))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"Cannot inspect existing output checkpoint: {exc}") from exc
+    if existing is None:
+        return
+    if existing != task_type:
+        raise ValueError(
+            f"Output directory belongs to task {existing}; selected task is {task_type}"
+        )
 
 
 def _trace_run_start(
@@ -79,9 +97,12 @@ def _trace_run_start(
     if tracer is None:
         return
     settings = run_settings.generation
+    workflow = get_task_workflow(run_settings.task_type)
     tracer.emit(
         {
             "event": "run_start",
+            "task_type": workflow.task_type,
+            "task_version": workflow.version,
             "source_path": str(run_settings.input),
             "source_sha256": source_fingerprint,
             "selected_poems": selected,
@@ -114,13 +135,7 @@ def _trace_run_start(
                 "max_network_retries": settings.max_network_retries,
                 "max_repairs": settings.max_repairs,
             },
-            "template_version": TEMPLATE_VERSION,
-            "template_rationale": TEMPLATE_RATIONALE,
-            "required_focuses": ALL_FOCUS_REQUIREMENTS,
-            "prompt_templates": [
-                {"template_id": template.template_id, "prompt": template.prompt}
-                for template in PROMPT_TEMPLATES
-            ],
+            **workflow.trace_metadata(),
         }
     )
 
@@ -128,6 +143,7 @@ def _trace_run_start(
 def run(run_settings: RunSettings) -> int:
     """Run generation with partial resume and optional three-endpoint pooling."""
     settings = run_settings.generation
+    workflow = get_task_workflow(run_settings.task_type)
     poems = load_poems(run_settings.input)
     if run_settings.selected_sample_ids is not None:
         available_ids = {poem.sample_id for poem in poems}
@@ -156,9 +172,26 @@ def run(run_settings: RunSettings) -> int:
         poems = poems[: run_settings.limit]
     if not poems:
         raise ValueError("No poems remain after applying the selection filters")
+    if run_settings.task_type != TASK_POEM_GENERATION:
+        oversized = [
+            poem
+            for poem in poems
+            if len(poem.poem_text) > settings.max_source_chars
+        ]
+        if oversized:
+            longest = max(len(poem.poem_text) for poem in oversized)
+            raise ValueError(
+                f"Task {run_settings.task_type} requires each complete poem, but "
+                f"{len(oversized)} selected poems exceed --max-source-chars="
+                f"{settings.max_source_chars} (longest: {longest}); lower "
+                "--max-couplets or raise --max-source-chars"
+            )
     source_fingerprint = file_sha256(run_settings.input)
-    contract_fingerprint = workflow_fingerprint(settings, source_fingerprint)
+    contract_fingerprint = workflow_fingerprint(
+        settings, source_fingerprint, run_settings.task_type
+    )
 
+    _validate_output_task(run_settings.output_dir, run_settings.task_type)
     run_settings.output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = run_settings.output_dir / "generation_checkpoint.jsonl"
     # Keep the legacy loader call so downstream integrations that patch or wrap it
@@ -170,7 +203,9 @@ def run(run_settings: RunSettings) -> int:
         sample_id: _normalize_reused_record(record)
         for sample_id, record in successes.items()
         if sample_id in selected_ids
-        and record.get("template_version") == TEMPLATE_VERSION
+        and record.get("task_type", TASK_POEM_GENERATION) == run_settings.task_type
+        and record.get("task_version", record.get("template_version"))
+        == workflow.version
         and (
             sample_id not in partial_state.success_fingerprints
             or partial_state.success_fingerprints[sample_id]
@@ -196,6 +231,7 @@ def run(run_settings: RunSettings) -> int:
                 run_settings.capacity_report,
                 settings,
                 source_sha256=source_fingerprint,
+                task_type=run_settings.task_type,
             )
         elif not run_settings.enforce_pilot_gate:
             capacity = configured_capacity_plan(settings)
@@ -210,6 +246,7 @@ def run(run_settings: RunSettings) -> int:
                 settings=settings,
                 source_sha256=source_fingerprint,
                 capacity_fingerprint=capacity.report_fingerprint,
+                task_type=run_settings.task_type,
             )
 
     tracer = (
@@ -278,6 +315,11 @@ def run(run_settings: RunSettings) -> int:
     write_jsonl(failures_jsonl, ())
     checkpoint_writer = CheckpointWriter(checkpoint_path)
     completed = len(poems) - len(pending)
+    task_generate_one = (
+        generate_one
+        if run_settings.task_type == TASK_POEM_GENERATION
+        else workflow.generate_one
+    )
     try:
         with ThreadPoolExecutor(
             max_workers=worker_count,
@@ -288,7 +330,7 @@ def run(run_settings: RunSettings) -> int:
                 per_sample_parallelism = run_settings.per_sample_chunk_cap
                 futures[
                     sample_executor.submit(
-                        generate_one,
+                        task_generate_one,
                         poem,
                         client,
                         settings,
@@ -297,6 +339,7 @@ def run(run_settings: RunSettings) -> int:
                         resume_chunks=partial_state.reasoning_chunks.get(
                             poem.sample_id, {}
                         ),
+                        resume_stages=partial_state.stages.get(poem.sample_id, {}),
                         checkpoint_writer=checkpoint_writer,
                         chunk_executor=chunk_executor,
                         chunk_parallelism=per_sample_parallelism,
@@ -313,6 +356,8 @@ def run(run_settings: RunSettings) -> int:
                     event = {
                         "event": "sample_success",
                         "sample_id": poem.sample_id,
+                        "task_type": workflow.task_type,
+                        "task_version": workflow.version,
                         "generation_fingerprint": contract_fingerprint,
                         "record": record,
                     }
@@ -332,6 +377,8 @@ def run(run_settings: RunSettings) -> int:
                     event = {
                         "event": "sample_failure",
                         "sample_id": poem.sample_id,
+                        "task_type": workflow.task_type,
+                        "task_version": workflow.version,
                         "generation_fingerprint": contract_fingerprint,
                         "category": failure_category,
                         "error": error,
@@ -343,6 +390,7 @@ def run(run_settings: RunSettings) -> int:
                         tracer.emit(
                             {
                                 "event": "sample_failure",
+                                "task_type": workflow.task_type,
                                 "sample_id": poem.sample_id,
                                 "error_type": type(exc).__name__,
                                 "category": failure_category,
@@ -357,6 +405,7 @@ def run(run_settings: RunSettings) -> int:
                         failures_jsonl,
                         {
                             "sample_id": poem.sample_id,
+                            "task_type": workflow.task_type,
                             "category": failure_category,
                             "error": error,
                         },
@@ -391,12 +440,16 @@ def run(run_settings: RunSettings) -> int:
         endpoint_metrics=endpoint_metrics,
         max_couplets=run_settings.max_couplets,
         excluded_long_poems=excluded_long_poems,
+        task_type=workflow.task_type,
+        task_version=workflow.version,
     )
     unresolved = [poem for poem in poems if poem.sample_id not in successes]
     if tracer is not None:
         tracer.emit(
             {
                 "event": "run_summary",
+                "task_type": workflow.task_type,
+                "task_version": workflow.version,
                 "selected_poems": len(poems),
                 "generated_successes": sum(
                     poem.sample_id in successes for poem in pending
@@ -406,7 +459,25 @@ def run(run_settings: RunSettings) -> int:
                 "excluded_long_poems": excluded_long_poems,
                 "complete": not unresolved,
                 "template_distribution": dict(
-                    Counter(record["template_id"] for record in successes.values())
+                    Counter(
+                        record["template_id"]
+                        for record in successes.values()
+                        if "template_id" in record
+                    )
+                ),
+                "question_domain_distribution": dict(
+                    Counter(
+                        record["question_domain"]
+                        for record in successes.values()
+                        if "question_domain" in record
+                    )
+                ),
+                "corruption_count_distribution": dict(
+                    Counter(
+                        str(record["corruption_count"])
+                        for record in successes.values()
+                        if "corruption_count" in record
+                    )
                 ),
                 "validation_status_distribution": dict(
                     Counter(

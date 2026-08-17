@@ -18,7 +18,12 @@ from ai_poet.synthetic_data.capacity import (
     validate_pilot_gate,
 )
 from ai_poet.synthetic_data.config import EndpointSettings
-from ai_poet.synthetic_data.pilot import PILOT_QUOTAS, select_pilot_poems
+from ai_poet.synthetic_data.pilot import (
+    BOUNDED_TASK_PILOT_QUOTAS,
+    PILOT_QUOTAS,
+    select_pilot_poems,
+)
+from ai_poet.synthetic_data.tasks.base import TASK_MCQ, TASK_POEM_RECONSTRUCTION
 from tests.synthetic_data_helpers import TEST_TMP, make_poem, remove_test_files, settings
 
 
@@ -88,6 +93,38 @@ class BenchmarkAndPilotTests(unittest.TestCase):
         )
         self.assertEqual(len(probes), 4)
 
+    def test_new_task_fixture_banks_are_task_shaped(self) -> None:
+        generation = settings(endpoints=endpoints())
+        poems = [make_poem()]
+        mcq_fixtures, mcq_probes = build_fixture_bank(
+            poems, generation, TASK_MCQ
+        )
+        reconstruction_fixtures, reconstruction_probes = build_fixture_bank(
+            poems, generation, TASK_POEM_RECONSTRUCTION
+        )
+        self.assertEqual(len(mcq_fixtures), 80)
+        self.assertEqual(len(reconstruction_fixtures), 80)
+        self.assertFalse(mcq_probes)
+        self.assertFalse(reconstruction_probes)
+        self.assertEqual(
+            sum(fixture.request_kind == "mcq_validation" for fixture in mcq_fixtures),
+            40,
+        )
+        self.assertEqual(
+            sum(
+                fixture.request_kind == "reconstruction_validation"
+                for fixture in reconstruction_fixtures
+            ),
+            40,
+        )
+
+    def test_generation_fingerprints_are_task_isolated(self) -> None:
+        generation = settings(endpoints=endpoints())
+        self.assertNotEqual(
+            generation_fingerprint(generation, TASK_MCQ),
+            generation_fingerprint(generation, TASK_POEM_RECONSTRUCTION),
+        )
+
     def test_capacity_selection_uses_smallest_level_at_ninety_five_percent(self) -> None:
         selected, nonconverged = select_capacity(
             [
@@ -143,6 +180,42 @@ class BenchmarkAndPilotTests(unittest.TestCase):
         )
         largest = max(oversized, key=lambda poem: len(poem.poem_text))
         self.assertIn(largest.sample_id, groups["oversized"])
+
+    def test_new_task_pilot_is_bounded_to_twenty_four_couplets(self) -> None:
+        generation = settings(endpoints=endpoints())
+        poems = []
+        serial = 0
+        for count, quota in ((2, 120), (5, 100), (12, 80)):
+            for _ in range(quota):
+                serial += 1
+                poems.append(
+                    make_poem(
+                        verses=tuple(
+                            part
+                            for couplet in range(count)
+                            for part in (
+                                f"صدر {serial}-{couplet}",
+                                f"عجز {serial}-{couplet}",
+                            )
+                        )
+                    )
+                )
+        poems.append(
+            make_poem(
+                verses=tuple(
+                    part
+                    for couplet in range(30)
+                    for part in (f"صدر طويل {couplet}", f"عجز طويل {couplet}")
+                )
+            )
+        )
+        selected, groups = select_pilot_poems(poems, generation, TASK_MCQ)
+        self.assertEqual(len(selected), 300)
+        self.assertEqual(
+            {name: len(sample_ids) for name, sample_ids in groups.items()},
+            BOUNDED_TASK_PILOT_QUOTAS,
+        )
+        self.assertTrue(all(poem.couplet_count <= 24 for poem in selected))
 
     def test_capacity_and_pilot_artifacts_are_fingerprint_checked(self) -> None:
         generation = settings(endpoints=endpoints())

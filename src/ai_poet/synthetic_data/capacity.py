@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import GenerationSettings
-from .prompts.templates import TEMPLATE_VERSION
+from .tasks.base import TASK_POEM_GENERATION, get_task_workflow
 
 
 REPORT_VERSION = 1
@@ -26,8 +26,12 @@ def _canonical_digest(value: Any) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def generation_contract(settings: GenerationSettings) -> dict[str, Any]:
+def generation_contract(
+    settings: GenerationSettings,
+    task_type: str = TASK_POEM_GENERATION,
+) -> dict[str, Any]:
     """Return the secret-free settings that determine request compatibility."""
+    workflow = get_task_workflow(task_type)
     return {
         "model": settings.model,
         "endpoints": [
@@ -38,28 +42,28 @@ def generation_contract(settings: GenerationSettings) -> dict[str, Any]:
             }
             for endpoint in settings.configured_endpoints
         ],
-        "template_version": TEMPLATE_VERSION,
-        "temperature": settings.temperature,
-        "top_p": settings.top_p,
-        "max_tokens": settings.max_tokens,
-        "min_chars": settings.min_chars,
-        "max_source_chars": settings.max_source_chars,
-        "chunk_chars": settings.chunk_chars,
+        "task_type": task_type,
+        "task_version": workflow.version,
+        **workflow.contract_settings(settings),
     }
 
 
-def generation_fingerprint(settings: GenerationSettings) -> str:
-    return _canonical_digest(generation_contract(settings))
+def generation_fingerprint(
+    settings: GenerationSettings,
+    task_type: str = TASK_POEM_GENERATION,
+) -> str:
+    return _canonical_digest(generation_contract(settings, task_type))
 
 
 def workflow_fingerprint(
     settings: GenerationSettings,
     source_sha256: str,
+    task_type: str = TASK_POEM_GENERATION,
 ) -> str:
     """Fingerprint accepted stages against settings and exact source bytes."""
     return _canonical_digest(
         {
-            "generation_fingerprint": generation_fingerprint(settings),
+            "generation_fingerprint": generation_fingerprint(settings, task_type),
             "source_sha256": source_sha256,
         }
     )
@@ -99,6 +103,7 @@ def load_capacity_report(
     settings: GenerationSettings,
     *,
     source_sha256: str | None = None,
+    task_type: str = TASK_POEM_GENERATION,
 ) -> CapacityPlan:
     """Load and strictly validate a certified endpoint-capacity report."""
     try:
@@ -110,7 +115,7 @@ def load_capacity_report(
         raise ValueError("Capacity report version is unsupported")
     if report.get("certified") is not True:
         raise ValueError("Capacity report is not certified")
-    expected_fingerprint = generation_fingerprint(settings)
+    expected_fingerprint = generation_fingerprint(settings, task_type)
     if report.get("generation_fingerprint") != expected_fingerprint:
         raise ValueError("Capacity report does not match current generation settings")
     if source_sha256 is not None and report.get("source_sha256") != source_sha256:
@@ -163,6 +168,7 @@ def validate_pilot_gate(
     settings: GenerationSettings,
     source_sha256: str,
     capacity_fingerprint: str,
+    task_type: str = TASK_POEM_GENERATION,
 ) -> tuple[str, str]:
     """Require a compatible passing pilot and thirty explicit approvals."""
     try:
@@ -179,7 +185,9 @@ def validate_pilot_gate(
         raise ValueError("Pilot automatic gate did not pass")
     if report.get("source_sha256") != source_sha256:
         raise ValueError("Pilot report does not match the input dataset")
-    if report.get("generation_fingerprint") != generation_fingerprint(settings):
+    if report.get("generation_fingerprint") != generation_fingerprint(
+        settings, task_type
+    ):
         raise ValueError("Pilot report does not match current generation settings")
     if report.get("capacity_report_fingerprint") != capacity_fingerprint:
         raise ValueError("Pilot report does not match the selected capacity report")

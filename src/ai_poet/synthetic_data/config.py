@@ -9,6 +9,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from .tasks.base import TASK_POEM_GENERATION, default_output_dir
+
 
 DEFAULT_MAX_COUPLETS = 24
 
@@ -83,6 +85,7 @@ class RunSettings:
     enforce_pilot_gate: bool = True
     selected_sample_ids: frozenset[str] | None = None
     max_couplets: int | None = DEFAULT_MAX_COUPLETS
+    task_type: str = TASK_POEM_GENERATION
 
 
 def _load_endpoints(global_model: str | None) -> tuple[EndpointSettings, ...]:
@@ -251,9 +254,11 @@ def load_run_settings(args: Namespace) -> RunSettings:
             raise ValueError(
                 "--pilot-report and --pilot-review are required in multi-endpoint mode"
             )
+    task_type = getattr(args, "task", TASK_POEM_GENERATION)
+    output_dir = args.output_dir or default_output_dir(task_type)
     return RunSettings(
         input=args.input,
-        output_dir=args.output_dir,
+        output_dir=output_dir,
         concurrency=requested_concurrency or 4,
         limit=args.limit,
         trace=args.trace,
@@ -264,4 +269,5 @@ def load_run_settings(args: Namespace) -> RunSettings:
         per_sample_chunk_cap=per_sample_chunk_cap,
         enforce_pilot_gate=enforce_pilot_gate,
         max_couplets=max_couplets,
+        task_type=task_type,
     )

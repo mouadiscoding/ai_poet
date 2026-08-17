@@ -9,6 +9,7 @@ import sys
 from .config import DEFAULT_MAX_COUPLETS, load_run_settings
 from .errors import GemmaConnectionError
 from .runner import run
+from .tasks.base import TASK_POEM_GENERATION, TASK_TYPES
 
 
 def build_parser() -> ArgumentParser:
@@ -29,7 +30,17 @@ def build_parser() -> ArgumentParser:
         type=Path,
         default=Path("data/ashaar_classic_moroccan.parquet"),
     )
-    parser.add_argument("--output-dir", type=Path, default=Path("data/ashaar_sft"))
+    parser.add_argument(
+        "--task",
+        choices=TASK_TYPES,
+        default=TASK_POEM_GENERATION,
+        help="SFT workflow to generate (default: poem-generation)",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        help="task-specific default is used when omitted",
+    )
     parser.add_argument("--insecure", action="store_true")
     parser.add_argument("--concurrency", type=int, default=4)
     parser.add_argument("--timeout", type=float, default=300.0)

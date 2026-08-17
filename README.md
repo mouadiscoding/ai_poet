@@ -1,12 +1,14 @@
 # Arabic poetry SFT generation
 
-This project builds a supervised fine-tuning dataset from
-`data/ashaar_classic_moroccan.parquet`. For every unique poem it asks an
-OpenAI-compatible Gemma endpoint to reverse-construct a detailed Arabic writing
-instruction. In a separate stage, it generates a structured editorial worklog
-for every couplet, including a rejected draft, revision reason, accepted line,
-prosodic or rhythmic review, and rhyme review. The program then renders those
-blocks and appends the original poem itself.
+This project builds Arabic supervised fine-tuning datasets from
+`data/ashaar_classic_moroccan.parquet`. A run selects one of three workflows:
+
+- `poem-generation` reverse-constructs a writing instruction and editorial
+  worklog, then appends the trusted source poem.
+- `mcq` creates one poem-grounded question with four choices, detailed answer
+  analysis, and exactly one correct answer.
+- `poem-reconstruction` creates localized corruptions, explains their repair,
+  and lets Python append the trusted original poem.
 
 The generator randomly chooses one of six concrete prompt templates for each
 poem. Every template and every few-shot example covers prosody or internal
@@ -115,10 +117,42 @@ Request concurrency comes from the capacity report. `--concurrency` remains a
 legacy single-endpoint option. Run any command with `--help` for its complete
 set of controls.
 
+### MCQ and reconstruction runs
+
+`poem-generation` remains the default, so existing commands continue to work.
+For another workflow, pass the same `--task` value to the benchmark, pilot, and
+generation commands. Capacity and pilot artifacts are task-specific and cannot
+be reused across workflows. When `--output-dir` is omitted, MCQ and
+reconstruction default to `data/ashaar_mcq_sft` and
+`data/ashaar_reconstruction_sft` respectively.
+
+For example, a single-endpoint smoke run can skip the production gate:
+
+```powershell
+uv run ai-poet-generate-sft `
+  --task mcq `
+  --limit 10 `
+  --skip-pilot-review `
+  --trace
+```
+
+```powershell
+uv run ai-poet-generate-sft `
+  --task poem-reconstruction `
+  --limit 10 `
+  --skip-pilot-review `
+  --trace
+```
+
+MCQ and reconstruction always send the complete selected poem. They fail
+before contacting Gemma if a selected poem exceeds `--max-source-chars`; they
+never substitute a summary for the required poem text.
+
 ## Resume and failure handling
 
-Accepted instructions and reasoning chunks are appended immediately to the
-versioned `generation_checkpoint.jsonl`, followed by the final sample event.
+Accepted stages are appended immediately to the version-3
+`generation_checkpoint.jsonl`, followed by the final sample event. Legacy
+version-1 and version-2 poem-generation checkpoints remain readable.
 Re-running skips compatible accepted stages as well as successful
 template-version-8 samples. Transient failures retry across healthy endpoints;
 429s, timeouts, latency pressure, and repeated server failures reduce only the
@@ -169,11 +203,13 @@ The output directory contains:
 - `failures.jsonl`: currently unresolved samples.
 - `manifest.json`: generation settings and aggregate counts.
 
-Each training record includes the source hash and provenance, endpoint IDs,
-network-attempt and failover counts, meter ID and
-name, couplet count, concrete template ID and version, generated `instruction`,
+Each training record includes `task_type`, `task_version`, a task-qualified
+`record_id`, the source hash and provenance, endpoint IDs, network-attempt and
+failover counts, meter ID and name, couplet count, generated `instruction`,
 composed `response`, OpenAI-style `messages`, deterministic `sft_split`, and
-quality flags. Exact
+quality flags. Poem-generation records retain their concrete template fields;
+MCQ records add the question domain, choices, and correct label; reconstruction
+records add the corrupted poem and corruption count. Exact
 duplicate poem texts share one record and retain all source row indices and
 URLs. Splits are assigned from the poem hash using 98% train, 1% validation,
 and 1% test buckets.

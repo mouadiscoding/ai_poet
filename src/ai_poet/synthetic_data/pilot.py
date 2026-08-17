@@ -20,6 +20,12 @@ from .config import GenerationSettings, RunSettings
 from .corpus import load_poems
 from .poems import PoemRecord
 from .runner import file_sha256, run
+from .tasks.base import (
+    TASK_MCQ,
+    TASK_POEM_GENERATION,
+    get_task_workflow,
+)
+from .tasks.mcq import QUESTION_DOMAINS
 
 
 PILOT_QUOTAS = {
@@ -31,6 +37,12 @@ PILOT_QUOTAS = {
     "oversized": 5,
 }
 
+BOUNDED_TASK_PILOT_QUOTAS = {
+    "couplets_1_3": 120,
+    "couplets_4_9": 100,
+    "couplets_10_24": 80,
+}
+
 
 @dataclass(frozen=True)
 class PilotSettings:
@@ -40,6 +52,7 @@ class PilotSettings:
     generation: GenerationSettings
     trace: bool = False
     per_sample_chunk_cap: int = 4
+    task_type: str = TASK_POEM_GENERATION
 
 
 def _group_name(poem: PoemRecord, settings: GenerationSettings) -> str:
@@ -60,14 +73,19 @@ def _group_name(poem: PoemRecord, settings: GenerationSettings) -> str:
 def select_pilot_poems(
     poems: Sequence[PoemRecord],
     settings: GenerationSettings,
+    task_type: str = TASK_POEM_GENERATION,
 ) -> tuple[list[PoemRecord], dict[str, list[str]]]:
     """Select the exact deterministic, tail-heavy pilot strata."""
-    grouped: dict[str, list[PoemRecord]] = {name: [] for name in PILOT_QUOTAS}
+    profile = get_task_workflow(task_type).pilot_profile
+    quotas = PILOT_QUOTAS if profile == "tail-heavy" else BOUNDED_TASK_PILOT_QUOTAS
+    grouped: dict[str, list[PoemRecord]] = {name: [] for name in quotas}
     for poem in poems:
-        grouped[_group_name(poem, settings)].append(poem)
+        name = _group_name(poem, settings)
+        if name in grouped:
+            grouped[name].append(poem)
     selected: list[PoemRecord] = []
     selected_groups: dict[str, list[str]] = {}
-    for name, quota in PILOT_QUOTAS.items():
+    for name, quota in quotas.items():
         candidates = grouped[name]
         if len(candidates) < quota:
             raise ValueError(
@@ -94,25 +112,59 @@ def _review_records(
     selected_groups: dict[str, list[str]],
     successes: dict[str, dict[str, Any]],
     existing: dict[str, dict[str, Any]],
+    task_type: str = TASK_POEM_GENERATION,
 ) -> list[dict[str, Any]]:
     review_ids: list[str] = []
-    for name in (
-        "oversized",
-        "couplets_1_3",
-        "couplets_4_9",
-        "couplets_10_24",
-        "couplets_25_74",
-        "couplets_75_plus",
-    ):
+    if task_type == TASK_POEM_GENERATION:
+        review_groups = [
+            (selected_groups[name], 5)
+            for name in (
+                "oversized",
+                "couplets_1_3",
+                "couplets_4_9",
+                "couplets_10_24",
+                "couplets_25_74",
+                "couplets_75_plus",
+            )
+        ]
+    elif task_type == TASK_MCQ:
+        review_groups = [
+            (
+                [
+                    sample_id
+                    for sample_id, record in successes.items()
+                    if record.get("question_domain") == domain_id
+                ],
+                6,
+            )
+            for domain_id, _label in QUESTION_DOMAINS
+        ]
+    else:
+        review_groups = [
+            (
+                [
+                    sample_id
+                    for sample_id, record in successes.items()
+                    if record.get("corruption_count") == count
+                ],
+                10,
+            )
+            for count in (1, 2, 3)
+        ]
+    for group, quota in review_groups:
         candidates = sorted(
-            selected_groups[name],
+            group,
             key=lambda sample_id: (
                 successes.get(sample_id, {}).get("validation_status")
                 != "passed_after_repair",
                 sample_id,
             ),
         )
-        review_ids.extend(candidates[:5])
+        review_ids.extend(candidates[:quota])
+    if len(review_ids) < 30:
+        remaining = sorted(set(successes) - set(review_ids))
+        review_ids.extend(remaining[: 30 - len(review_ids)])
+    review_ids = review_ids[:30]
     return [
         {
             "sample_id": sample_id,
@@ -129,9 +181,11 @@ def _pilot_content_fingerprint(
     capacity_fingerprint: str,
     selected_ids: set[str],
     successes: dict[str, dict[str, Any]],
+    task_type: str = TASK_POEM_GENERATION,
 ) -> str:
     value = {
-        "generation_fingerprint": generation_fingerprint(generation),
+        "task_type": task_type,
+        "generation_fingerprint": generation_fingerprint(generation, task_type),
         "capacity_report_fingerprint": capacity_fingerprint,
         "selected_ids": sorted(selected_ids),
         "outputs": [
@@ -158,12 +212,15 @@ def run_pilot(settings: PilotSettings) -> int:
     if not settings.generation.is_multi_endpoint:
         raise ValueError("The production pilot requires indexed three-endpoint settings")
     poems = load_poems(settings.input)
-    selected, selected_groups = select_pilot_poems(poems, settings.generation)
+    selected, selected_groups = select_pilot_poems(
+        poems, settings.generation, settings.task_type
+    )
     source_sha256 = file_sha256(settings.input)
     capacity = load_capacity_report(
         settings.capacity_report,
         settings.generation,
         source_sha256=source_sha256,
+        task_type=settings.task_type,
     )
     run_settings = RunSettings(
         input=settings.input,
@@ -177,6 +234,7 @@ def run_pilot(settings: PilotSettings) -> int:
         enforce_pilot_gate=False,
         selected_sample_ids=frozenset(poem.sample_id for poem in selected),
         max_couplets=None,
+        task_type=settings.task_type,
     )
     started = time.perf_counter()
     run(run_settings)
@@ -190,6 +248,7 @@ def run_pilot(settings: PilotSettings) -> int:
         sample_id: record
         for sample_id, record in successes.items()
         if sample_id in selected_ids
+        and record.get("task_type", TASK_POEM_GENERATION) == settings.task_type
     }
     failures = {
         sample_id: error
@@ -228,13 +287,18 @@ def run_pilot(settings: PilotSettings) -> int:
         capacity_fingerprint=capacity.report_fingerprint,
         selected_ids=selected_ids,
         successes=successes,
+        task_type=settings.task_type,
     )
     report = {
         "report_version": PILOT_REPORT_VERSION,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "passed": passed,
+        "task_type": settings.task_type,
+        "task_version": get_task_workflow(settings.task_type).version,
         "source_sha256": source_sha256,
-        "generation_fingerprint": generation_fingerprint(settings.generation),
+        "generation_fingerprint": generation_fingerprint(
+            settings.generation, settings.task_type
+        ),
         "capacity_report_fingerprint": capacity.report_fingerprint,
         "content_fingerprint": content_fingerprint,
         "selected_samples": 300,
@@ -296,7 +360,9 @@ def run_pilot(settings: PilotSettings) -> int:
             "Inspect each sample in ashaar_sft.jsonl or ashaar_sft.parquet, "
             "then set approved to true or false and add optional notes."
         ),
-        "reviews": _review_records(selected_groups, successes, existing),
+        "reviews": _review_records(
+            selected_groups, successes, existing, settings.task_type
+        ),
     }
     review_path.write_text(
         json.dumps(review, ensure_ascii=False, indent=2) + "\n",

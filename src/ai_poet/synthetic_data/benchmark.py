@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -31,6 +31,21 @@ from .prompts.builder import (
 from .prompts.examples import METERED_FEW_SHOTS, METERED_REASONING_FEW_SHOT
 from .prompts.templates import PROMPT_TEMPLATES
 from .runner import file_sha256
+from .tasks.base import (
+    TASK_MCQ,
+    TASK_POEM_GENERATION,
+    get_task_workflow,
+)
+from .tasks.mcq import (
+    build_generation_messages as build_mcq_messages,
+    build_validation_messages as build_mcq_validation_messages,
+    question_domain,
+)
+from .tasks.reconstruction import (
+    build_generation_messages as build_reconstruction_messages,
+    build_validation_messages as build_reconstruction_validation_messages,
+    corruption_count,
+)
 
 
 DEFAULT_LEVELS = (1, 2, 4, 8, 16, 24, 32)
@@ -41,6 +56,7 @@ class BenchmarkSettings:
     input: Path
     output_dir: Path
     generation: GenerationSettings
+    task_type: str = TASK_POEM_GENERATION
     duration_per_level: float = 300.0
     warmup_seconds: float = 30.0
     concurrency_levels: tuple[int, ...] = DEFAULT_LEVELS
@@ -82,7 +98,7 @@ def _stable_poem_choices(poems: Sequence[PoemRecord]) -> list[PoemRecord]:
     return selected
 
 
-def build_fixture_bank(
+def _build_poem_generation_fixture_bank(
     poems: Sequence[PoemRecord],
     settings: GenerationSettings,
 ) -> tuple[list[BenchmarkFixture], list[BenchmarkFixture]]:
@@ -214,6 +230,109 @@ def build_fixture_bank(
             BenchmarkFixture("chunk_analysis", messages, 800, 0.2, 40_000 + index)
         )
     return fixtures, probes
+
+
+def _example_mcq_candidate() -> dict[str, Any]:
+    answers = ["يرمز الليل إلى الشدة", "يدل الليل على الفرح", "يصف رحلة بحرية", "يمدح مدينة"]
+    return {
+        "question": "ما الدلالة الأقرب لصورة الليل في سياق القصيدة؟",
+        "correct_answer": answers[0],
+        "distractors": answers[1:],
+        "reasoning": {
+            "approach": "أربط صورة الليل بما يليها من صبر وضياء لأحدد وظيفتها الدلالية.",
+            "evidence": ["اقتران الليل بالضياء اللاحق"],
+            "answer_assessments": [
+                {
+                    "answer": answer,
+                    "assessment": "هذا تقدير مفصل لعلاقة الخيار بالمعنى الظاهر في سياق القصيدة."
+                }
+                for answer in answers
+            ],
+            "conclusion": "يؤيد تتابع الشدة والانفراج الجواب الأول دون بقية البدائل."
+        },
+    }
+
+
+def _example_reconstruction_candidate(poem: PoemRecord) -> dict[str, Any]:
+    return {
+        "corrupted_poem": poem.poem_text,
+        "repairs": [
+            {
+                "couplet_index": 1,
+                "corrupted_fragment": "لفظ محرّف",
+                "corrected_fragment": "لفظ سليم",
+                "diagnosis": "اللفظ المحرف يقطع المعنى الذي يمهد له سياق البيت.",
+                "context_evidence": "تدل الألفاظ المجاورة على معنى مختلف متماسك.",
+                "repair_reason": "يعيد اللفظ السليم الصلة الدلالية والجرس المناسب."
+            }
+        ],
+    }
+
+
+def _build_simple_task_fixture_bank(
+    poems: Sequence[PoemRecord],
+    settings: GenerationSettings,
+    task_type: str,
+) -> tuple[list[BenchmarkFixture], list[BenchmarkFixture]]:
+    selected = _stable_poem_choices(poems)
+    fixtures: list[BenchmarkFixture] = []
+    for index in range(40):
+        poem = selected[index % len(selected)]
+        if task_type == TASK_MCQ:
+            messages = build_mcq_messages(poem, question_domain(poem.sample_id)[1])
+            kind = "mcq_generation"
+        else:
+            messages = build_reconstruction_messages(poem, corruption_count(poem))
+            kind = "reconstruction_generation"
+        if index < 10:
+            messages = _repair_messages(
+                messages,
+                "{}",
+                ["benchmark repair-shaped request"],
+            )
+            kind = kind.replace("_generation", "_repair")
+        fixtures.append(
+            BenchmarkFixture(
+                kind,
+                tuple(messages),
+                settings.max_tokens,
+                settings.temperature,
+                index + 1,
+            )
+        )
+
+    for index in range(40):
+        poem = selected[index % len(selected)]
+        if task_type == TASK_MCQ:
+            messages = build_mcq_validation_messages(
+                poem,
+                question_domain(poem.sample_id)[1],
+                _example_mcq_candidate(),
+            )
+            kind = "mcq_validation"
+        else:
+            messages = build_reconstruction_validation_messages(
+                poem,
+                _example_reconstruction_candidate(poem),
+            )
+            kind = "reconstruction_validation"
+        fixtures.append(
+            BenchmarkFixture(kind, tuple(messages), 1200, 0.0, 10_000 + index)
+        )
+    return fixtures, []
+
+
+def build_fixture_bank(
+    poems: Sequence[PoemRecord],
+    settings: GenerationSettings,
+    task_type: str = TASK_POEM_GENERATION,
+) -> tuple[list[BenchmarkFixture], list[BenchmarkFixture]]:
+    profile = get_task_workflow(task_type).benchmark_profile
+    if profile == "poem-generation":
+        return _build_poem_generation_fixture_bank(poems, settings)
+    if profile == "single-generation-validation":
+        return _build_simple_task_fixture_bank(poems, settings, task_type)
+    raise ValueError(f"Unsupported benchmark profile: {profile}")
 
 
 def _percentile(values: Sequence[float], fraction: float) -> float:
@@ -372,7 +491,10 @@ def select_capacity(results: Sequence[dict[str, Any]]) -> tuple[int, bool]:
 
 def _benchmark_digest(settings: BenchmarkSettings, source_sha256: str) -> str:
     value = {
-        "generation_fingerprint": generation_fingerprint(settings.generation),
+        "task_type": settings.task_type,
+        "generation_fingerprint": generation_fingerprint(
+            settings.generation, settings.task_type
+        ),
         "source_sha256": source_sha256,
         "duration_per_level": settings.duration_per_level,
         "warmup_seconds": settings.warmup_seconds,
@@ -476,7 +598,9 @@ def run_benchmark(settings: BenchmarkSettings) -> int:
     settings.output_dir.mkdir(parents=True, exist_ok=True)
     poems = load_poems(settings.input)
     source_sha256 = file_sha256(settings.input)
-    fixtures, oversized_probes = build_fixture_bank(poems, settings.generation)
+    fixtures, oversized_probes = build_fixture_bank(
+        poems, settings.generation, settings.task_type
+    )
     fingerprint = _benchmark_digest(settings, source_sha256)
     checkpoint = settings.output_dir / "endpoint_benchmark.jsonl"
     completed = _load_completed(checkpoint, fingerprint)
@@ -707,16 +831,21 @@ def run_benchmark(settings: BenchmarkSettings) -> int:
         "report_version": REPORT_VERSION,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "certified": certified,
+        "task_type": settings.task_type,
+        "task_version": get_task_workflow(settings.task_type).version,
         "benchmark_fingerprint": fingerprint,
-        "generation_fingerprint": generation_fingerprint(settings.generation),
+        "generation_fingerprint": generation_fingerprint(
+            settings.generation, settings.task_type
+        ),
         "source_sha256": source_sha256,
         "fixture_mix": {
-            "total": 80,
-            "instruction_generation": 8,
-            "instruction_validation": 8,
-            "reasoning_generation": 32,
-            "reasoning_validation": 32,
-            "repair_shaped_generation": 10,
+            "total": len(fixtures),
+            "request_kinds": dict(
+                sorted(Counter(fixture.request_kind for fixture in fixtures).items())
+            ),
+            "repair_shaped_generation": sum(
+                "repair" in fixture.request_kind for fixture in fixtures
+            ),
         },
         "preflight": {
             "endpoints": preflight,

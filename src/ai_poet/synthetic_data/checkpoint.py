@@ -9,7 +9,7 @@ import threading
 from typing import Any
 
 
-CHECKPOINT_VERSION = 2
+CHECKPOINT_VERSION = 3
 
 
 @dataclass
@@ -21,6 +21,7 @@ class CheckpointState:
     reasoning_chunks: dict[str, dict[int, dict[str, Any]]] = field(
         default_factory=dict
     )
+    stages: dict[str, dict[str, dict[str, Any]]] = field(default_factory=dict)
 
 
 def load_checkpoint_state(path: Path) -> CheckpointState:
@@ -58,8 +59,48 @@ def load_checkpoint_state(path: Path) -> CheckpointState:
             elif event == "sample_failure":
                 if sample_id not in state.successes:
                     state.failures[sample_id] = record.get("error", "unknown error")
+            elif event == "stage_success":
+                stage_name = str(record.get("stage_name", ""))
+                stage_key = str(record.get("stage_key", stage_name))
+                payload = record.get("payload")
+                if not stage_name or not isinstance(payload, dict):
+                    raise ValueError(
+                        f"Invalid stage checkpoint on line {line_number}"
+                    )
+                flattened = {
+                    **record,
+                    **payload,
+                    "generation_fingerprint": record.get(
+                        "workflow_fingerprint",
+                        record.get("generation_fingerprint"),
+                    ),
+                }
+                state.stages.setdefault(sample_id, {})[stage_key] = flattened
+                if (
+                    record.get("task_type", "poem-generation")
+                    == "poem-generation"
+                    and stage_name == "instruction"
+                ):
+                    state.instructions[sample_id] = flattened
+                    previous = state.reasoning_chunks.get(sample_id, {})
+                    state.reasoning_chunks[sample_id] = {
+                        start: chunk
+                        for start, chunk in previous.items()
+                        if chunk.get("instruction_fingerprint")
+                        == flattened.get("instruction_fingerprint")
+                    }
+                elif (
+                    record.get("task_type", "poem-generation")
+                    == "poem-generation"
+                    and stage_name == "reasoning_chunk"
+                ):
+                    start_offset = int(flattened["start_offset"])
+                    state.reasoning_chunks.setdefault(sample_id, {})[
+                        start_offset
+                    ] = flattened
             elif event == "instruction_success":
                 state.instructions[sample_id] = record
+                state.stages.setdefault(sample_id, {})["instruction"] = record
                 previous = state.reasoning_chunks.get(sample_id, {})
                 state.reasoning_chunks[sample_id] = {
                     start: chunk
@@ -70,6 +111,9 @@ def load_checkpoint_state(path: Path) -> CheckpointState:
             elif event == "reasoning_chunk_success":
                 start_offset = int(record["start_offset"])
                 state.reasoning_chunks.setdefault(sample_id, {})[start_offset] = record
+                state.stages.setdefault(sample_id, {})[
+                    f"reasoning_chunk:{start_offset}"
+                ] = record
     return state
 
 

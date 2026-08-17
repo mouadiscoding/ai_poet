@@ -11,8 +11,30 @@ from ai_poet.synthetic_data.config import (
     load_generation_settings,
     load_run_settings,
 )
+from ai_poet.synthetic_data.tasks.base import TASK_MCQ, TASK_POEM_GENERATION
 
 class ConfigurationTests(unittest.TestCase):
+    def test_task_selector_preserves_default_and_accepts_mcq(self) -> None:
+        self.assertEqual(build_parser().parse_args([]).task, TASK_POEM_GENERATION)
+        self.assertEqual(
+            build_parser().parse_args(["--task", TASK_MCQ]).task,
+            TASK_MCQ,
+        )
+
+    def test_task_selector_uses_task_specific_default_output(self) -> None:
+        args = build_parser().parse_args(["--task", TASK_MCQ])
+        environment = {
+            "GEMMA_ENDPOINT": "https://env.example/v1/chat/completions",
+            "GEMMA_MODEL": "env-model",
+            "GEMMA_API_KEY": "env-secret",
+        }
+        with (
+            patch("ai_poet.synthetic_data.config.load_dotenv"),
+            patch.dict("os.environ", environment, clear=True),
+        ):
+            result = load_run_settings(args)
+        self.assertEqual(result.output_dir.as_posix(), "data/ashaar_mcq_sft")
+
     def test_settings_load_required_values_from_dotenv(self) -> None:
         args = build_parser().parse_args([])
         environment = {
