@@ -113,6 +113,91 @@ exactly one endpoint-mode sequence below.
 | Three endpoints, standard safeguards | Yes | Yes | `--capacity-report`, `--pilot-report`, and `--pilot-review` |
 | Three endpoints, safeguards skipped | No | No | `--skip-pilot-review` |
 
+### Using a different source dataset
+
+Pass `--input` to any generation recipe to replace the default
+`data/ashaar_classic_moroccan.parquet`. Use a separate output directory so
+checkpoints and generated records from another source dataset are not mixed:
+
+```powershell
+just generate-single poem-generation 4 `
+  --input data/my_poems.parquet `
+  --output-dir data/my_poems_sft `
+  --limit 10
+```
+
+The input is a source-poem corpus, not an existing SFT dataset containing
+`messages`, `prompt`, or `completion`. Its Parquet schema must contain all six
+columns below. Column order does not matter, and additional columns are
+ignored.
+
+| Column | Required data |
+| --- | --- |
+| `poem_title` | String or null |
+| `poem_theme` | String or null |
+| `poem_meter` | Integer meter ID from 0 through 16 |
+| `poem_verses` | Non-empty, even-length list of strings |
+| `poem_url` | String or null |
+| `poet_name` | String or null |
+
+`poem_verses` stores individual hemistichs in reading order. Consecutive
+elements form one couplet: positions 0 and 1 are the first couplet, positions
+2 and 3 are the second, and so on. For example:
+
+```python
+import pandas as pd
+
+rows = [
+    {
+        "poem_title": "عنوان القصيدة",
+        "poem_theme": "مدح",
+        "poem_meter": 5,
+        "poem_verses": [
+            "صدر البيت الأول",
+            "عجز البيت الأول",
+            "صدر البيت الثاني",
+            "عجز البيت الثاني",
+        ],
+        "poem_url": "https://example.com/poem",
+        "poet_name": "اسم الشاعر",
+    }
+]
+
+pd.DataFrame(rows).to_parquet("data/my_poems.parquet", index=False)
+```
+
+Meter IDs use the fixed mapping in
+`src/ai_poet/synthetic_data/meters.py`; for example, `0` is `البسيط`, `5` is
+`الطويل`, `6` is `الكامل`, `14` is `النثر`, and `16` is `الوافر`. Exact
+duplicate verse lists are deduplicated automatically. Duplicate rows that
+disagree on the meter must have an unambiguous majority meter or loading
+fails. Poems above 24 couplets are excluded by default; change the cap with
+`--max-couplets`.
+
+For a safeguarded three-endpoint run, pass the same `--input` to the benchmark,
+pilot, and final generation commands, and give the new dataset its own capacity
+and output directories. Capacity and pilot artifacts contain the source file's
+SHA-256 fingerprint and cannot be reused with a different Parquet file:
+
+```powershell
+just benchmark poem-generation `
+  --input data/my_poems.parquet `
+  --output-dir data/my_poems_capacity
+
+just pilot poem-generation `
+  --input data/my_poems.parquet `
+  --output-dir data/my_poems_sft `
+  --capacity-report data/my_poems_capacity/endpoint_capacity.json
+
+# Approve data/my_poems_sft/pilot_review.json, then run:
+just generate poem-generation `
+  --input data/my_poems.parquet `
+  --output-dir data/my_poems_sft `
+  --capacity-report data/my_poems_capacity/endpoint_capacity.json `
+  --pilot-report data/my_poems_sft/pilot_report.json `
+  --pilot-review data/my_poems_sft/pilot_review.json
+```
+
 ### Using one API endpoint
 
 After configuring the unindexed `.env` variables, run generation directly.
