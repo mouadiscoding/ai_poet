@@ -11,7 +11,11 @@ from ai_poet.synthetic_data.config import (
     load_generation_settings,
     load_run_settings,
 )
-from ai_poet.synthetic_data.tasks.base import TASK_MCQ, TASK_POEM_GENERATION
+from ai_poet.synthetic_data.tasks.base import (
+    TASK_MCQ,
+    TASK_POEM_COMPLETION,
+    TASK_POEM_GENERATION,
+)
 
 class ConfigurationTests(unittest.TestCase):
     def test_task_selector_preserves_default_and_accepts_mcq(self) -> None:
@@ -19,6 +23,10 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(
             build_parser().parse_args(["--task", TASK_MCQ]).task,
             TASK_MCQ,
+        )
+        self.assertEqual(
+            build_parser().parse_args(["--task", TASK_POEM_COMPLETION]).task,
+            TASK_POEM_COMPLETION,
         )
 
     def test_task_selector_uses_task_specific_default_output(self) -> None:
@@ -34,6 +42,18 @@ class ConfigurationTests(unittest.TestCase):
         ):
             result = load_run_settings(args)
         self.assertEqual(result.output_dir.as_posix(), "data/ashaar_mcq_sft")
+
+        completion_args = build_parser().parse_args(
+            ["--task", TASK_POEM_COMPLETION]
+        )
+        with (
+            patch("ai_poet.synthetic_data.config.load_dotenv"),
+            patch.dict("os.environ", environment, clear=True),
+        ):
+            completion = load_run_settings(completion_args)
+        self.assertEqual(
+            completion.output_dir.as_posix(), "data/ashaar_completion_sft"
+        )
 
     def test_settings_load_required_values_from_dotenv(self) -> None:
         args = build_parser().parse_args([])

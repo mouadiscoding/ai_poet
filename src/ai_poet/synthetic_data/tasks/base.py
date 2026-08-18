@@ -8,16 +8,19 @@ from typing import Any, Callable, Sequence
 
 
 TASK_POEM_GENERATION = "poem-generation"
+TASK_POEM_COMPLETION = "poem-completion"
 TASK_MCQ = "mcq"
 TASK_POEM_RECONSTRUCTION = "poem-reconstruction"
 TASK_TYPES = (
     TASK_POEM_GENERATION,
+    TASK_POEM_COMPLETION,
     TASK_MCQ,
     TASK_POEM_RECONSTRUCTION,
 )
 
 DEFAULT_OUTPUT_DIRS = {
     TASK_POEM_GENERATION: Path("data/ashaar_sft"),
+    TASK_POEM_COMPLETION: Path("data/ashaar_completion_sft"),
     TASK_MCQ: Path("data/ashaar_mcq_sft"),
     TASK_POEM_RECONSTRUCTION: Path("data/ashaar_reconstruction_sft"),
 }
@@ -59,6 +62,8 @@ def get_task_workflow(task_type: str) -> TaskWorkflow:
     """Load one workflow lazily to avoid task/runner import cycles."""
     if task_type == TASK_POEM_GENERATION:
         from .poem_generation import WORKFLOW
+    elif task_type == TASK_POEM_COMPLETION:
+        from .completion import WORKFLOW
     elif task_type == TASK_MCQ:
         from .mcq import WORKFLOW
     elif task_type == TASK_POEM_RECONSTRUCTION:

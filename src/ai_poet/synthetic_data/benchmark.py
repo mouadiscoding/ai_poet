@@ -36,6 +36,11 @@ from .tasks.base import (
     TASK_POEM_GENERATION,
     get_task_workflow,
 )
+from .tasks.completion import (
+    compose_completion_instruction,
+    poem_beginning,
+    provided_couplet_count,
+)
 from .tasks.mcq import (
     MCQWorkItem,
     build_generation_messages as build_mcq_messages,
@@ -102,9 +107,16 @@ def _stable_poem_choices(poems: Sequence[PoemRecord]) -> list[PoemRecord]:
 def _build_poem_generation_fixture_bank(
     poems: Sequence[PoemRecord],
     settings: GenerationSettings,
+    *,
+    completion: bool = False,
 ) -> tuple[list[BenchmarkFixture], list[BenchmarkFixture]]:
-    """Build an 80-request production-shaped mix plus oversized probes."""
-    selected = _stable_poem_choices(poems)
+    """Build the 80-request poem-writing mix and optional oversized probes."""
+    eligible = (
+        [poem for poem in poems if poem.couplet_count >= 2]
+        if completion
+        else list(poems)
+    )
+    selected = _stable_poem_choices(eligible)
     example = METERED_FEW_SHOTS[0]
     example_reasoning = METERED_REASONING_FEW_SHOT
     fixtures: list[BenchmarkFixture] = []
@@ -157,10 +169,19 @@ def _build_poem_generation_fixture_bank(
     for index in range(32):
         poem = selected[index % len(selected)]
         couplets = poem.poem_text.splitlines()
+        reasoning_instruction = example.instruction
+        if completion:
+            provided = provided_couplet_count(poem)
+            reasoning_instruction = compose_completion_instruction(
+                reasoning_instruction,
+                beginning=poem_beginning(poem, provided),
+                total_couplets=poem.couplet_count,
+                provided_couplets=provided,
+            )
         start_offset = (index * 3) % len(couplets)
         chunk = couplets[start_offset : start_offset + 3]
         messages = build_reasoning_messages(
-            instruction=example.instruction,
+            instruction=reasoning_instruction,
             meter_name=poem.meter_name,
             total_couplet_count=poem.couplet_count,
             start_index=start_offset + 1,
@@ -194,9 +215,18 @@ def _build_poem_generation_fixture_bank(
         block["revised_draft"]
         for block in example_reasoning["response"]["verse_reasoning"]
     ]
+    validation_instruction = example_reasoning["instruction"]
+    if completion:
+        example_couplets = example_reasoning["poem"].splitlines()
+        validation_instruction = compose_completion_instruction(
+            validation_instruction,
+            beginning=example_couplets[0],
+            total_couplets=len(example_couplets),
+            provided_couplets=1,
+        )
     validation_messages = tuple(
         build_reasoning_validation_messages(
-            instruction=example_reasoning["instruction"],
+            instruction=validation_instruction,
             meter_name=example_reasoning["meter_name"],
             expected_couplets=validation_targets,
             candidate=example_reasoning["response"],
@@ -212,6 +242,9 @@ def _build_poem_generation_fixture_bank(
         )
         for index in range(32)
     )
+
+    if completion:
+        return fixtures, []
 
     oversized = sorted(poems, key=lambda poem: (-len(poem.poem_text), poem.sample_id))
     probes: list[BenchmarkFixture] = []
@@ -333,6 +366,10 @@ def build_fixture_bank(
     profile = get_task_workflow(task_type).benchmark_profile
     if profile == "poem-generation":
         return _build_poem_generation_fixture_bank(poems, settings)
+    if profile == "poem-completion":
+        return _build_poem_generation_fixture_bank(
+            poems, settings, completion=True
+        )
     if profile == "single-generation-validation":
         return _build_simple_task_fixture_bank(poems, settings, task_type)
     raise ValueError(f"Unsupported benchmark profile: {profile}")

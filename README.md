@@ -1,10 +1,13 @@
 # Arabic poetry SFT generation
 
 This project builds Arabic supervised fine-tuning datasets from
-`data/ashaar_classic_moroccan.parquet`. A run selects one of three workflows:
+`data/ashaar_classic_moroccan.parquet`. A run selects one of four workflows:
 
 - `poem-generation` reverse-constructs a writing instruction and editorial
   worklog, then appends the trusted source poem.
+- `poem-completion` adds a reproducibly selected complete-couplet beginning to
+  the same detailed writing instruction and full editorial worklog. Gemma does
+  not generate the consolidated final poem; Python appends the trusted source.
 - `mcq` applies meter, theme, and title question templates to each poem. Each
   template has multiple uniformly selected question phrasings; the stored
   metadata is supplied as the exact ground-truth answer, and a template is
@@ -95,6 +98,14 @@ across tasks.
 $task = "poem-generation"
 $outputDir = "data/ashaar_sft"
 $capacityDir = "data/gemma_capacity"
+```
+
+### Task: poem completion
+
+```powershell
+$task = "poem-completion"
+$outputDir = "data/ashaar_completion_sft"
+$capacityDir = "data/gemma_capacity_poem_completion"
 ```
 
 ### Task: MCQ
@@ -274,13 +285,16 @@ Each training record includes `task_type`, `task_version`, a task-qualified
 `record_id`, the source hash and provenance, endpoint IDs, network-attempt and
 failover counts, meter ID and name, couplet count, generated `instruction`,
 composed `response`, OpenAI-style `messages`, deterministic `sft_split`, and
-quality flags. Poem-generation records retain their concrete template fields;
-MCQ records add the metadata field, selected prompt ID, trusted ground-truth
-answer, question, choices, and correct label; reconstruction records add the
-corrupted poem and corruption count. Exact duplicate poem texts share one canonical
-source poem and retain all source row indices and URLs. MCQ can emit up to
-three records from that canonical poem. Splits are assigned from the poem hash
-using 98% train, 1% validation, and 1% test buckets.
+quality flags. Poem-generation records retain their concrete template fields.
+Completion records also add `poem_beginning`, `provided_couplet_count`, and
+`remaining_couplet_count`; one-couplet poems are skipped because no complete
+couplet remains to generate. MCQ records add the metadata field, selected prompt
+ID, trusted ground-truth answer, question, choices, and correct label;
+reconstruction records add the corrupted poem and corruption count. Exact
+duplicate poem texts share one canonical source poem and retain all source row
+indices and URLs. MCQ can emit up to three records from that canonical poem.
+Splits are assigned from the poem hash using 98% train, 1% validation, and 1%
+test buckets.
 
 Full prompts and raw model responses are deliberately excluded from
 `ashaar_sft.jsonl` and `ashaar_sft.parquet`. Keeping them in the separate trace
@@ -308,6 +322,12 @@ source poem formatted as:
 Because the pipeline starts from an existing poem, the worklog is a synthetic
 editorial reconstruction, not a claim about the historical poet's private
 thoughts.
+
+For poem completion, the beginning ends at a complete-couplet boundary selected
+uniformly by a local RNG seeded from the task version and poem hash. The same
+poem therefore receives the same beginning across retries and reruns. Gemma
+returns only the validated instruction and structured editorial work; Python
+owns the single exact full-poem section at the end of the assistant response.
 
 ## Tests
 

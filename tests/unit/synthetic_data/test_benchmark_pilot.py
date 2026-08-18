@@ -23,7 +23,11 @@ from ai_poet.synthetic_data.pilot import (
     PILOT_QUOTAS,
     select_pilot_poems,
 )
-from ai_poet.synthetic_data.tasks.base import TASK_MCQ, TASK_POEM_RECONSTRUCTION
+from ai_poet.synthetic_data.tasks.base import (
+    TASK_MCQ,
+    TASK_POEM_COMPLETION,
+    TASK_POEM_RECONSTRUCTION,
+)
 from tests.synthetic_data_helpers import TEST_TMP, make_poem, remove_test_files, settings
 
 
@@ -102,14 +106,25 @@ class BenchmarkAndPilotTests(unittest.TestCase):
         reconstruction_fixtures, reconstruction_probes = build_fixture_bank(
             poems, generation, TASK_POEM_RECONSTRUCTION
         )
+        completion_fixtures, completion_probes = build_fixture_bank(
+            poems, generation, TASK_POEM_COMPLETION
+        )
         self.assertEqual(len(mcq_fixtures), 80)
         self.assertEqual(len(reconstruction_fixtures), 80)
+        self.assertEqual(len(completion_fixtures), 80)
         self.assertFalse(mcq_probes)
         self.assertFalse(reconstruction_probes)
+        self.assertFalse(completion_probes)
         self.assertEqual(
             sum(fixture.request_kind == "mcq_validation" for fixture in mcq_fixtures),
             40,
         )
+        completion_reasoning = next(
+            fixture
+            for fixture in completion_fixtures
+            if fixture.request_kind == "reasoning_generation"
+        )
+        self.assertIn("بداية القصيدة:", completion_reasoning.messages[-1]["content"])
         self.assertEqual(
             sum(
                 fixture.request_kind == "reconstruction_validation"
@@ -122,6 +137,10 @@ class BenchmarkAndPilotTests(unittest.TestCase):
         generation = settings(endpoints=endpoints())
         self.assertNotEqual(
             generation_fingerprint(generation, TASK_MCQ),
+            generation_fingerprint(generation, TASK_POEM_RECONSTRUCTION),
+        )
+        self.assertNotEqual(
+            generation_fingerprint(generation, TASK_POEM_COMPLETION),
             generation_fingerprint(generation, TASK_POEM_RECONSTRUCTION),
         )
 
@@ -216,6 +235,36 @@ class BenchmarkAndPilotTests(unittest.TestCase):
             BOUNDED_TASK_PILOT_QUOTAS,
         )
         self.assertTrue(all(poem.couplet_count <= 24 for poem in selected))
+
+    def test_completion_pilot_excludes_single_couplet_poems(self) -> None:
+        generation = settings(endpoints=endpoints())
+        poems = [make_poem(verses=("صدر وحيد", "عجز وحيد"))]
+        serial = 0
+        for count, quota in ((2, 120), (5, 100), (12, 80)):
+            for _ in range(quota):
+                serial += 1
+                poems.append(
+                    make_poem(
+                        verses=tuple(
+                            part
+                            for couplet in range(count)
+                            for part in (
+                                f"صدر {serial}-{couplet}",
+                                f"عجز {serial}-{couplet}",
+                            )
+                        )
+                    )
+                )
+
+        selected, groups = select_pilot_poems(
+            poems, generation, TASK_POEM_COMPLETION
+        )
+        self.assertEqual(len(selected), 300)
+        self.assertTrue(all(poem.couplet_count >= 2 for poem in selected))
+        self.assertEqual(
+            {name: len(sample_ids) for name, sample_ids in groups.items()},
+            BOUNDED_TASK_PILOT_QUOTAS,
+        )
 
     def test_capacity_and_pilot_artifacts_are_fingerprint_checked(self) -> None:
         generation = settings(endpoints=endpoints())

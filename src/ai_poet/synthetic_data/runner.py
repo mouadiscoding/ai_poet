@@ -192,7 +192,7 @@ def run(run_settings: RunSettings) -> int:
     work_items = workflow.expand_work_items(poems)
     if not work_items:
         raise ValueError(
-            f"No {run_settings.task_type} work items have the required metadata"
+            f"No {run_settings.task_type} work items remain after task eligibility filters"
         )
     source_fingerprint = file_sha256(run_settings.input)
     contract_fingerprint = workflow_fingerprint(

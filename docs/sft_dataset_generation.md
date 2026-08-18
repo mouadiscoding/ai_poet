@@ -18,9 +18,15 @@ and other constraints from each source poem. It does not ask Gemma to reproduce
 the final target. The Python code appends the original poem itself so that model
 copying errors cannot corrupt the SFT answer.
 
-Two additional workflows use the same corpus, endpoint pool, retries, tracing,
+Three additional workflows use the same corpus, endpoint pool, retries, tracing,
 checkpointing, splits, and exporters:
 
+- `poem-completion` augments the poem-generation instruction with a complete-
+  couplet prefix chosen uniformly by a local RNG seeded from the task version
+  and poem hash. It retains whole-poem editorial reasoning. Gemma never emits
+  the consolidated final poem; Python appends the exact complete source poem.
+  Poems with only one couplet are skipped because no complete-couplet suffix
+  would remain.
 - `mcq` applies templates for `poem_meter`, `poem_theme`, and `poem_title`.
   Each template contains multiple Arabic question phrasings, one of which is
   chosen uniformly with a deterministic per-poem seed. The stored metadata
@@ -34,10 +40,10 @@ checkpointing, splits, and exporters:
   and diacritic-only fragment variants from the exact local diff, and appends
   the exact source poem; Gemma never emits the complete corrected poem.
 
-All three commands accept `--task poem-generation`, `--task mcq`, or
-`--task poem-reconstruction`. The first remains the default. Each task has its
-own contract version and fingerprints, so capacity reports, pilot artifacts,
-checkpoints, and output directories cannot be mixed.
+All three commands accept `--task poem-generation`, `--task poem-completion`,
+`--task mcq`, or `--task poem-reconstruction`. The first remains the default.
+Each task has its own contract version and fingerprints, so capacity reports,
+pilot artifacts, checkpoints, and output directories cannot be mixed.
 
 ## Source corpus findings
 
@@ -218,6 +224,13 @@ anything after an accidental result marker, then appends exactly one canonical
 marker and the exact source poem. The endpoint therefore cannot rewrite, normalize,
 re-diacritize, or hallucinate the final target.
 
+For poem completion, the validated instruction is augmented deterministically
+with `بداية القصيدة:` and `مهمة الإكمال:` sections. These contain the exact
+prefix plus the total, provided, and remaining couplet counts. Reasoning still
+covers every couplet, including the supplied beginning. The endpoint is asked
+only for structured reasoning chunks; the same Python renderer appends the
+trusted complete source poem.
+
 ## Poem-size controls
 
 The SFT generator excludes poems above `--max-couplets` before applying
@@ -225,9 +238,10 @@ The SFT generator excludes poems above `--max-couplets` before applying
 three-couplet reasoning chunks. Raising the cap is an explicit choice to target
 a larger downstream training context.
 
-For an admitted poem, the direct source limit defaults to 24,000 characters. A
-longer poem is split at complete-couplet boundaries into chunks of at most
-12,000 characters.
+For an admitted poem, the direct source limit defaults to 24,000 characters.
+Only poem generation can split a longer poem at complete-couplet boundaries
+into chunks of at most 12,000 characters. Completion, MCQ, and reconstruction
+require the complete selected poem to fit the direct source limit.
 
 For each source-size chunk, the endpoint receives a compact-analysis request.
 The ordered summaries are used only by the global instruction stage. Editorial
@@ -396,7 +410,7 @@ The pipeline writes the same logical records to `ashaar_sft.jsonl` and
 | --- | --- |
 | `sample_id` | SHA-256 of the exact source hemistich sequence |
 | `record_id` | Task-qualified record identifier; MCQ also appends its metadata field |
-| `task_type` | `poem-generation`, `mcq`, or `poem-reconstruction` |
+| `task_type` | `poem-generation`, `poem-completion`, `mcq`, or `poem-reconstruction` |
 | `task_version` | Version of the selected task contract |
 | `source_row_indices` | All original rows represented by the record |
 | `source_urls` | All retained source URLs |
@@ -406,6 +420,9 @@ The pipeline writes the same logical records to `ashaar_sft.jsonl` and
 | `meter_id` | Original numeric base-meter class |
 | `meter_name` | Decoded Arabic base-meter name |
 | `couplet_count` | Number of hemistich pairs |
+| `poem_beginning` | Exact seeded complete-couplet prefix for poem completion |
+| `provided_couplet_count` | Number of couplets supplied in that prefix |
+| `remaining_couplet_count` | Number of couplets left to complete |
 | `template_id` | Selected concrete prompt template |
 | `template_version` | Prompt and validation contract version; currently `8` |
 | `instruction` | Generated Arabic user instruction |
@@ -424,8 +441,9 @@ The pipeline writes the same logical records to `ashaar_sft.jsonl` and
 | `network_attempts` | Total HTTP attempts associated with the sample |
 | `truncated_completions` | Responses whose endpoint finish reason was `length` |
 
-Poem-generation retains `template_id`, `template_version`, and its
-instruction/reasoning attempt counters. MCQ adds `metadata_field`, `prompt_id`,
+Poem generation and completion retain `template_id`, `template_version`, and
+their instruction/reasoning attempt counters. The three prefix fields above
+appear only on completion records. MCQ adds `metadata_field`, `prompt_id`,
 `ground_truth_answer`, `question`, four labeled `choices`, and
 `correct_choice_label`. Its record ID is
 `mcq:<sample_id>:<metadata_field>`, allowing each applicable template to be
@@ -563,7 +581,7 @@ override with:
 uv run ai-poet-generate-sft --help
 ```
 
-### Running MCQ or reconstruction
+### Running completion, MCQ, or reconstruction
 
 Use the same task value for capacity certification, the pilot, and the final
 run. For example, the MCQ production sequence is:
@@ -579,11 +597,12 @@ uv run ai-poet-generate-sft --task mcq `
   --pilot-review data/ashaar_mcq_sft/pilot_review.json
 ```
 
-Replace `mcq` with `poem-reconstruction` for reconstruction. When no output
-directory is supplied, the two workflows use `data/ashaar_mcq_sft` and
-`data/ashaar_reconstruction_sft`. Both require the complete poem and fail
-preflight if any selected poem exceeds `--max-source-chars`; only the default
-poem-generation workflow may replace an oversized source with chunk summaries.
+Replace `mcq` with `poem-completion` or `poem-reconstruction` for those tasks.
+Their default output directories are `data/ashaar_completion_sft`,
+`data/ashaar_mcq_sft`, and `data/ashaar_reconstruction_sft`, respectively. All
+three require the complete poem and fail preflight if any selected poem exceeds
+`--max-source-chars`; only poem generation may replace an oversized source with
+chunk summaries.
 
 ## Verification
 
@@ -604,6 +623,8 @@ It covers:
 - JSON and fenced-JSON extraction.
 - Strict Gemma verdict parsing, rejection feedback, and repair.
 - Exact source-poem preservation.
+- Seeded complete-couplet completion prefixes, one-couplet filtering, full-
+  poem reasoning, generic stage resume, and Python-owned exact final poems.
 - Oversized-poem summaries and synthesis.
 - Template-version-aware checkpoint reuse.
 - JSONL and Parquet round trips.

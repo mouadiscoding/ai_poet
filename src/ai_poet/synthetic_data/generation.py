@@ -392,9 +392,54 @@ def generate_one(
     chunk_executor: Executor | None = None,
     chunk_parallelism: int = 1,
 ) -> dict[str, Any]:
-    """Generate one SFT record while reusing compatible accepted stages."""
-    del resume_stages  # Generic runner view; legacy arguments remain authoritative.
-    resume_chunks = resume_chunks or {}
+    """Generate one poem-generation record with legacy resume compatibility."""
+    return generate_poem_writing_record(
+        poem,
+        client,
+        settings,
+        task_type="poem-generation",
+        task_version=TEMPLATE_VERSION,
+        generation_fingerprint=generation_fingerprint,
+        resume_instruction=resume_instruction,
+        resume_chunks=resume_chunks,
+        resume_stages=resume_stages,
+        checkpoint_writer=checkpoint_writer,
+        chunk_executor=chunk_executor,
+        chunk_parallelism=chunk_parallelism,
+    )
+
+
+def generate_poem_writing_record(
+    poem: PoemRecord,
+    client: GemmaClient,
+    settings: GenerationSettings,
+    *,
+    task_type: str,
+    task_version: int,
+    instruction_augmenter: Callable[[str], str] | None = None,
+    record_metadata: dict[str, Any] | None = None,
+    generation_fingerprint: str = "legacy",
+    resume_instruction: dict[str, Any] | None = None,
+    resume_chunks: dict[int, dict[str, Any]] | None = None,
+    resume_stages: dict[str, dict[str, Any]] | None = None,
+    checkpoint_writer: CheckpointWriter | None = None,
+    chunk_executor: Executor | None = None,
+    chunk_parallelism: int = 1,
+) -> dict[str, Any]:
+    """Generate one validated poem-writing record for a registered task."""
+    resume_stages = resume_stages or {}
+    if resume_instruction is None:
+        resume_instruction = resume_stages.get("instruction")
+    if not resume_chunks:
+        resume_chunks = {
+            int(stage["start_offset"]): stage
+            for stage in resume_stages.values()
+            if stage.get("stage_name") == "reasoning_chunk"
+            and "start_offset" in stage
+        }
+    else:
+        resume_chunks = dict(resume_chunks)
+    record_metadata = record_metadata or {}
     effective_capacity = getattr(client, "total_effective_capacity", 1)
     chunk_parallelism = min(
         chunk_parallelism,
@@ -423,6 +468,7 @@ def generate_one(
         client,
         {
             "event": "template_selection",
+            "task_type": task_type,
             "sample_id": poem.sample_id,
             "source_row_indices": list(poem.source_row_indices),
             "poet_name": poem.poet_name,
@@ -478,6 +524,8 @@ def generate_one(
             source_material=source_material,
             seed=seed,
         )
+        if instruction_augmenter is not None:
+            instruction = instruction_augmenter(instruction)
 
     instruction_fingerprint = _instruction_fingerprint(
         generation_fingerprint,
@@ -489,8 +537,8 @@ def generate_one(
             {
                 "event": "stage_success",
                 "sample_id": poem.sample_id,
-                "task_type": "poem-generation",
-                "task_version": TEMPLATE_VERSION,
+                "task_type": task_type,
+                "task_version": task_version,
                 "stage_name": "instruction",
                 "stage_key": "instruction",
                 "workflow_fingerprint": generation_fingerprint,
@@ -547,8 +595,8 @@ def generate_one(
                     {
                         "event": "stage_success",
                         "sample_id": poem.sample_id,
-                        "task_type": "poem-generation",
-                        "task_version": TEMPLATE_VERSION,
+                        "task_type": task_type,
+                        "task_version": task_version,
                         "stage_name": "reasoning_chunk",
                         "stage_key": f"reasoning_chunk:{start_offset}",
                         "workflow_fingerprint": generation_fingerprint,
@@ -608,9 +656,9 @@ def generate_one(
     )
     record = {
         "sample_id": poem.sample_id,
-        "record_id": f"poem-generation:{poem.sample_id}",
-        "task_type": "poem-generation",
-        "task_version": TEMPLATE_VERSION,
+        "record_id": f"{task_type}:{poem.sample_id}",
+        "task_type": task_type,
+        "task_version": task_version,
         "source_row_indices": list(poem.source_row_indices),
         "source_urls": list(poem.source_urls),
         "poet_name": poem.poet_name,
@@ -618,6 +666,7 @@ def generate_one(
         "meter_id": poem.meter_id,
         "meter_name": poem.meter_name,
         "couplet_count": poem.couplet_count,
+        **record_metadata,
         "template_id": template.template_id,
         "template_version": TEMPLATE_VERSION,
         "instruction": instruction,
@@ -640,6 +689,7 @@ def generate_one(
         client,
         {
             "event": "final_output",
+            "task_type": task_type,
             "sample_id": poem.sample_id,
             "template_id": template.template_id,
             "parsed_instruction": instruction,

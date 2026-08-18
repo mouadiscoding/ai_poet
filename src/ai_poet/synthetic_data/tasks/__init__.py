@@ -3,6 +3,7 @@
 from .base import (
     DEFAULT_OUTPUT_DIRS,
     TASK_MCQ,
+    TASK_POEM_COMPLETION,
     TASK_POEM_GENERATION,
     TASK_POEM_RECONSTRUCTION,
     TASK_TYPES,
@@ -14,6 +15,7 @@ from .base import (
 __all__ = [
     "DEFAULT_OUTPUT_DIRS",
     "TASK_MCQ",
+    "TASK_POEM_COMPLETION",
     "TASK_POEM_GENERATION",
     "TASK_POEM_RECONSTRUCTION",
     "TASK_TYPES",

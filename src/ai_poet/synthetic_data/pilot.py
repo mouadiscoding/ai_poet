@@ -22,6 +22,7 @@ from .poems import PoemRecord
 from .runner import file_sha256, run
 from .tasks.base import (
     TASK_MCQ,
+    TASK_POEM_COMPLETION,
     TASK_POEM_GENERATION,
     get_task_workflow,
 )
@@ -80,6 +81,8 @@ def select_pilot_poems(
     quotas = PILOT_QUOTAS if profile == "tail-heavy" else BOUNDED_TASK_PILOT_QUOTAS
     grouped: dict[str, list[PoemRecord]] = {name: [] for name in quotas}
     for poem in poems:
+        if profile == "bounded-poem-completion" and poem.couplet_count < 2:
+            continue
         name = _group_name(poem, settings)
         if name in grouped:
             grouped[name].append(poem)
@@ -138,6 +141,15 @@ def _review_records(
                 10,
             )
             for template in MCQ_TEMPLATES
+        ]
+    elif task_type == TASK_POEM_COMPLETION:
+        review_groups = [
+            (selected_groups[name], 10)
+            for name in (
+                "couplets_1_3",
+                "couplets_4_9",
+                "couplets_10_24",
+            )
         ]
     else:
         review_groups = [

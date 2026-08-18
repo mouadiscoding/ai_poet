@@ -9,9 +9,12 @@ from unittest.mock import patch
 
 from ai_poet.synthetic_data.checkpoint import CheckpointWriter, load_checkpoint_state
 from ai_poet.synthetic_data.config import RunSettings
+from ai_poet.synthetic_data.outputs import write_outputs
+from ai_poet.synthetic_data.prompts.templates import TEMPLATE_VERSION
 from ai_poet.synthetic_data.runner import _validate_output_task, run
 from ai_poet.synthetic_data.tasks.base import (
     TASK_MCQ,
+    TASK_POEM_COMPLETION,
     TASK_POEM_GENERATION,
     TASK_POEM_RECONSTRUCTION,
     default_output_dir,
@@ -25,6 +28,12 @@ from ai_poet.synthetic_data.tasks.mcq import (
     generate_one as generate_mcq,
     order_choices,
 )
+from ai_poet.synthetic_data.tasks.completion import (
+    build_work_items as build_completion_work_items,
+    generate_one as generate_completion,
+    poem_beginning,
+    provided_couplet_count,
+)
 from ai_poet.synthetic_data.tasks.reconstruction import (
     build_generation_messages as build_reconstruction_messages,
     corruption_count,
@@ -37,6 +46,7 @@ from tests.synthetic_data_helpers import (
     make_poem,
     remove_test_files,
     settings,
+    valid_pipeline_outputs,
     valid_verdict,
 )
 
@@ -115,8 +125,13 @@ class TaskRegistryTests(unittest.TestCase):
             TASK_POEM_GENERATION,
         )
         self.assertEqual(get_task_workflow(TASK_MCQ).version, 3)
+        self.assertEqual(get_task_workflow(TASK_POEM_COMPLETION).version, 1)
         self.assertEqual(get_task_workflow(TASK_POEM_RECONSTRUCTION).version, 2)
         self.assertEqual(default_output_dir(TASK_MCQ), Path("data/ashaar_mcq_sft"))
+        self.assertEqual(
+            default_output_dir(TASK_POEM_COMPLETION),
+            Path("data/ashaar_completion_sft"),
+        )
 
     def test_output_directory_rejects_another_task(self) -> None:
         TEST_TMP.mkdir(parents=True, exist_ok=True)
@@ -219,6 +234,162 @@ class TaskRegistryTests(unittest.TestCase):
         self.assertEqual(manifest["generated_records"], 3)
         records = (output_dir / "ashaar_sft.jsonl").read_text("utf-8")
         self.assertIn(f'"task_type": "{TASK_MCQ}"', records)
+
+
+class CompletionWorkflowTests(unittest.TestCase):
+    def test_prefix_is_seeded_varied_and_couplet_aligned(self) -> None:
+        verses = tuple(
+            part
+            for couplet in range(1, 9)
+            for part in (f"صدر البيت {couplet}", f"عجز البيت {couplet}")
+        )
+        poem = make_poem(verses=verses)
+        self.assertEqual(
+            provided_couplet_count(poem), provided_couplet_count(poem)
+        )
+        self.assertEqual(
+            poem_beginning(poem).splitlines(),
+            poem.poem_text.splitlines()[: provided_couplet_count(poem)],
+        )
+
+        cutoffs = {
+            provided_couplet_count(replace(poem, sample_id=f"{index:064x}"))
+            for index in range(100)
+        }
+        self.assertGreater(len(cutoffs), 1)
+        self.assertTrue(all(1 <= cutoff < poem.couplet_count for cutoff in cutoffs))
+
+    def test_work_items_skip_poems_without_a_full_couplet_to_complete(self) -> None:
+        one_couplet = make_poem(verses=("صدر وحيد", "عجز وحيد"))
+        two_couplets = make_poem()
+        self.assertEqual(
+            build_completion_work_items([one_couplet, two_couplets]),
+            [two_couplets],
+        )
+        with self.assertRaisesRegex(ValueError, "at least two couplets"):
+            provided_couplet_count(one_couplet)
+
+    def test_generation_adds_prefix_and_python_owned_exact_final_poem(self) -> None:
+        poem = make_poem()
+        client = QueueClient(valid_pipeline_outputs(poem))
+        record = generate_completion(poem, client, settings())
+
+        self.assertEqual(record["task_type"], TASK_POEM_COMPLETION)
+        self.assertEqual(record["task_version"], 1)
+        self.assertEqual(
+            record["record_id"], f"{TASK_POEM_COMPLETION}:{poem.sample_id}"
+        )
+        self.assertEqual(record["poem_beginning"], poem.poem_text.splitlines()[0])
+        self.assertEqual(record["provided_couplet_count"], 1)
+        self.assertEqual(record["remaining_couplet_count"], 1)
+        self.assertIn("بداية القصيدة:", record["instruction"])
+        self.assertIn(record["poem_beginning"], record["instruction"])
+        self.assertIn("عدد أبيات القصيدة كاملة: 2", record["instruction"])
+        self.assertIn("عدد الأبيات المعطاة أعلاه: 1", record["instruction"])
+        self.assertIn("عدد الأبيات المطلوب إضافتها: 1", record["instruction"])
+        self.assertIn("البيت 1:", record["response"])
+        self.assertIn("البيت 2:", record["response"])
+        self.assertEqual(record["response"].count("النتيجة النهائية:"), 1)
+        self.assertTrue(record["response"].endswith(poem.poem_text))
+        self.assertEqual(
+            [kwargs["trace_context"]["request_kind"] for kwargs in client.call_kwargs],
+            [
+                "instruction_generation",
+                "instruction_validation",
+                "reasoning_generation",
+                "reasoning_validation",
+            ],
+        )
+
+    def test_generic_stages_resume_completion_without_model_calls(self) -> None:
+        name = "completion_stage_checkpoint.jsonl"
+        remove_test_files(name)
+        self.addCleanup(remove_test_files, name)
+        TEST_TMP.mkdir(exist_ok=True)
+        poem = make_poem()
+        path = TEST_TMP / name
+        first = generate_completion(
+            poem,
+            QueueClient(valid_pipeline_outputs(poem)),
+            settings(),
+            generation_fingerprint="completion-fingerprint",
+            checkpoint_writer=CheckpointWriter(path),
+        )
+        stages = load_checkpoint_state(path).stages[poem.sample_id]
+        client = QueueClient([])
+        resumed = generate_completion(
+            poem,
+            client,
+            settings(),
+            generation_fingerprint="completion-fingerprint",
+            resume_stages=stages,
+        )
+        self.assertFalse(client.calls)
+        self.assertEqual(resumed["instruction"], first["instruction"])
+        self.assertEqual(resumed["response"], first["response"])
+
+    def test_runner_enforces_completion_eligibility_and_source_bound(self) -> None:
+        one_couplet = make_poem(verses=("صدر وحيد", "عجز وحيد"))
+        base = RunSettings(
+            input=Path("unused.parquet"),
+            output_dir=TEST_TMP,
+            concurrency=1,
+            limit=None,
+            trace=False,
+            generation=settings(),
+            task_type=TASK_POEM_COMPLETION,
+        )
+        with (
+            patch(
+                "ai_poet.synthetic_data.runner.load_poems",
+                return_value=[one_couplet],
+            ),
+            self.assertRaisesRegex(ValueError, "eligibility filters"),
+        ):
+            run(base)
+
+        oversized = replace(
+            base,
+            generation=settings(max_source_chars=10),
+        )
+        with (
+            patch(
+                "ai_poet.synthetic_data.runner.load_poems",
+                return_value=[make_poem()],
+            ),
+            self.assertRaisesRegex(ValueError, "requires each complete poem"),
+        ):
+            run(oversized)
+
+    def test_completion_manifest_reports_generation_template_version(self) -> None:
+        generated_files = (
+            "ashaar_sft.jsonl",
+            "ashaar_sft.parquet",
+            "failures.jsonl",
+            "manifest.json",
+        )
+        remove_test_files(*generated_files)
+        self.addCleanup(remove_test_files, *generated_files)
+        TEST_TMP.mkdir(exist_ok=True)
+        poem = make_poem()
+        record = {
+            "sample_id": poem.sample_id,
+            "task_type": TASK_POEM_COMPLETION,
+            "sft_split": "train",
+            "template_id": "semantic_arc",
+            "validation_status": "passed",
+        }
+        write_outputs(
+            TEST_TMP,
+            [poem],
+            {poem.sample_id: record},
+            {},
+            settings(),
+            task_type=TASK_POEM_COMPLETION,
+            task_version=1,
+        )
+        manifest = json.loads((TEST_TMP / "manifest.json").read_text("utf-8"))
+        self.assertEqual(manifest["template_version"], TEMPLATE_VERSION)
 
 
 class McqWorkflowTests(unittest.TestCase):
