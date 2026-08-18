@@ -488,6 +488,10 @@ enabled, its `run_id`, and the sidecar filename.
 
 ## Running the pipeline
 
+Install [`just`](https://just.systems/man/en/packages.html) once with
+`uv tool install rust-just`. Running `just` in the repository root lists all
+available recipes.
+
 Create a local `.env` from the committed example, then set the model and three
 endpoint records:
 
@@ -528,35 +532,24 @@ indexed and unindexed settings cannot be mixed. Then run the generator without
 capacity or pilot artifacts:
 
 ```powershell
-uv run ai-poet-generate-sft `
-  --input data/ashaar_classic_moroccan.parquet `
-  --output-dir data/ashaar_sft_single `
-  --concurrency 32 `
-  --max-couplets 24 `
-  --insecure
+just generate-single poem-generation 32 --output-dir data/ashaar_sft_single
 ```
 
 In single-endpoint mode, `--concurrency` sets the number of concurrent sample
-workers; choose a value within that endpoint's safe capacity. Omit `--insecure`
-when the endpoint presents a certificate trusted by the local system.
+workers; choose a value within that endpoint's safe capacity. Network-facing
+Just recipes pass `--insecure` by default and should be used only with trusted
+internal endpoints.
 
 Certify the endpoint capacities:
 
 ```powershell
-uv run ai-poet-benchmark-endpoints `
-  --input data/ashaar_classic_moroccan.parquet `
-  --output-dir data/gemma_capacity `
-  --insecure
+just benchmark poem-generation
 ```
 
 Run the strict 300-poem pilot:
 
 ```powershell
-uv run ai-poet-pilot-sft `
-  --input data/ashaar_classic_moroccan.parquet `
-  --output-dir data/ashaar_sft `
-  --capacity-report data/gemma_capacity/endpoint_capacity.json `
-  --insecure
+just pilot poem-generation
 ```
 
 After the automatic gate passes, inspect all records named by
@@ -564,21 +557,14 @@ After the automatic gate passes, inspect all records named by
 corpus:
 
 ```powershell
-uv run ai-poet-generate-sft `
-  --input data/ashaar_classic_moroccan.parquet `
-  --output-dir data/ashaar_sft `
-  --capacity-report data/gemma_capacity/endpoint_capacity.json `
-  --pilot-report data/ashaar_sft/pilot_report.json `
-  --pilot-review data/ashaar_sft/pilot_review.json `
-  --max-couplets 24 `
-  --insecure
+just generate poem-generation
 ```
 
 Re-running the same command resumes from the checkpoint. See every available
 override with:
 
 ```powershell
-uv run ai-poet-generate-sft --help
+just generate-help
 ```
 
 ### Running completion, MCQ, or reconstruction
@@ -587,14 +573,9 @@ Use the same task value for capacity certification, the pilot, and the final
 run. For example, the MCQ production sequence is:
 
 ```powershell
-uv run ai-poet-benchmark-endpoints --task mcq `
-  --output-dir data/gemma_capacity_mcq
-uv run ai-poet-pilot-sft --task mcq `
-  --capacity-report data/gemma_capacity_mcq/endpoint_capacity.json
-uv run ai-poet-generate-sft --task mcq `
-  --capacity-report data/gemma_capacity_mcq/endpoint_capacity.json `
-  --pilot-report data/ashaar_mcq_sft/pilot_report.json `
-  --pilot-review data/ashaar_mcq_sft/pilot_review.json
+just benchmark mcq
+just pilot mcq
+just generate mcq
 ```
 
 Replace `mcq` with `poem-completion` or `poem-reconstruction` for those tasks.
@@ -609,7 +590,7 @@ chunk summaries.
 The automated suite is offline and uses fake API clients:
 
 ```powershell
-uv run python -m unittest discover -s tests -v
+just test
 ```
 
 It covers:

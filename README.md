@@ -80,51 +80,31 @@ Remove `GEMMA_ENDPOINT` and `GEMMA_API_KEY`. If all three deployments use the
 same served-model name, one shared `GEMMA_MODEL` may replace
 `GEMMA_MODEL_1..3`; do not use both model forms.
 
-The client verifies TLS certificates by default. Append `--insecure` to a
-command only when all relevant internal endpoints use certificates you trust
-but cannot verify normally. Process-environment values override matching
-`.env` values.
+The underlying CLI verifies TLS certificates by default. The Just recipes in
+this guide pass `--insecure`, so use them only with internal endpoints you
+trust. Process-environment values override matching `.env` values.
 
-## Choose the command sequence
+## Run commands with Just
 
-First select exactly one task configuration in the PowerShell session where
-you will run the commands. The task, output directory, and capacity directory
-must stay together because benchmark and pilot artifacts cannot be reused
-across tasks.
-
-### Task: poem generation
+Install [`just`](https://just.systems/man/en/packages.html) once with the `uv`
+already used by this project:
 
 ```powershell
-$task = "poem-generation"
-$outputDir = "data/ashaar_sft"
-$capacityDir = "data/gemma_capacity"
+uv tool install rust-just
 ```
 
-### Task: poem completion
+Run `just` in the repository root to list every recipe. Recipes accept one of
+these task names and default to `poem-generation` when it is omitted:
 
-```powershell
-$task = "poem-completion"
-$outputDir = "data/ashaar_completion_sft"
-$capacityDir = "data/gemma_capacity_poem_completion"
-```
+- `poem-generation`
+- `poem-completion`
+- `mcq`
+- `poem-reconstruction`
 
-### Task: MCQ
-
-```powershell
-$task = "mcq"
-$outputDir = "data/ashaar_mcq_sft"
-$capacityDir = "data/gemma_capacity_mcq"
-```
-
-### Task: poem reconstruction
-
-```powershell
-$task = "poem-reconstruction"
-$outputDir = "data/ashaar_reconstruction_sft"
-$capacityDir = "data/gemma_capacity_poem_reconstruction"
-```
-
-After choosing one block, follow exactly one endpoint-mode sequence below.
+The recipes keep each task's output, capacity, and pilot paths together because
+artifacts cannot be reused across tasks. The examples below use
+`poem-generation`; replace it with another task name when needed. Follow
+exactly one endpoint-mode sequence below.
 
 | Endpoint mode | Run benchmark? | Run pilot? | Generation gate arguments |
 | --- | --- | --- | --- |
@@ -138,12 +118,7 @@ After configuring the unindexed `.env` variables, run generation directly.
 Do not pass capacity or pilot reports, and do not pass `--skip-pilot-review`:
 
 ```powershell
-uv run ai-poet-generate-sft `
-  --input data/ashaar_classic_moroccan.parquet `
-  --task $task `
-  --output-dir $outputDir `
-  --concurrency 32 `
-  --max-couplets 24
+just generate-single poem-generation 32
 ```
 
 Choose `--concurrency` within the single endpoint's tested capacity.
@@ -158,39 +133,25 @@ This is the safeguarded production sequence. Do not add
    `endpoint_capacity.json` when its certification gates pass.
 
    ```powershell
-   uv run ai-poet-benchmark-endpoints `
-     --input data/ashaar_classic_moroccan.parquet `
-     --task $task `
-     --output-dir $capacityDir
+   just benchmark poem-generation
    ```
 
 2. Run the deterministic pilot using that capacity report. Accepted pilot
    records are written to the final output checkpoint and reused later.
 
    ```powershell
-   uv run ai-poet-pilot-sft `
-     --input data/ashaar_classic_moroccan.parquet `
-     --task $task `
-     --output-dir $outputDir `
-     --capacity-report "$capacityDir/endpoint_capacity.json"
+   just pilot poem-generation
    ```
 
-3. Open `$outputDir/pilot_review.json`, inspect the 30 selected records, set
-   each accepted record's `approved` value to `true`, and add notes where
-   useful. The pilot must have reached at least 98% success, no more than 25%
-   repaired records, and zero truncations.
+3. Open the task output directory's `pilot_review.json`, inspect the 30 selected
+   records, set each accepted record's `approved` value to `true`, and add notes
+   where useful. The pilot must have reached at least 98% success, no more than
+   25% repaired records, and zero truncations.
 
 4. Start or resume full generation with all three artifacts.
 
    ```powershell
-   uv run ai-poet-generate-sft `
-     --input data/ashaar_classic_moroccan.parquet `
-     --task $task `
-     --output-dir $outputDir `
-     --capacity-report "$capacityDir/endpoint_capacity.json" `
-     --pilot-report "$outputDir/pilot_report.json" `
-     --pilot-review "$outputDir/pilot_review.json" `
-     --max-couplets 24
+   just generate poem-generation
    ```
 
 The benchmark defaults to a 30-second warmup and a five-minute measurement at
@@ -207,12 +168,7 @@ name, `--skip-pilot-review` skips all three gates, so neither the benchmark nor
 pilot command is needed:
 
 ```powershell
-uv run ai-poet-generate-sft `
-  --input data/ashaar_classic_moroccan.parquet `
-  --task $task `
-  --output-dir $outputDir `
-  --skip-pilot-review `
-  --max-couplets 24
+just generate-unsafe poem-generation
 ```
 
 This command prints a warning and uses each endpoint's
@@ -220,11 +176,16 @@ This command prints a warning and uses each endpoint's
 and `--pilot-review`; also omit `--concurrency`, which does not control the
 three-endpoint pool.
 
-For a small inspection run, add `--limit 10 --trace` to the generation
-command. MCQ and reconstruction always send the complete selected poem and
-fail before contacting Gemma if it exceeds `--max-source-chars`. For MCQ,
-`--limit` counts source poems rather than output records; each selected poem
-produces a meter record and, when available, theme and title records.
+For a small inspection run, append additional CLI arguments to the recipe:
+
+```powershell
+just generate poem-generation --limit 10 --trace
+```
+
+MCQ and reconstruction always send the complete selected poem and fail before
+contacting Gemma if it exceeds `--max-source-chars`. For MCQ, `--limit` counts
+source poems rather than output records; each selected poem produces a meter
+record and, when available, theme and title records.
 
 ## Resume and failure handling
 
@@ -335,7 +296,7 @@ The test suite uses fake API clients and does not require a credential or
 network connection:
 
 ```powershell
-uv run python -m unittest discover -s tests -v
+just test
 ```
 
 ## Data-use notice
