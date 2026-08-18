@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path
@@ -430,6 +431,7 @@ def run(run_settings: RunSettings) -> int:
                     )
                 with PRINT_LOCK:
                     print(
+                        f"[{datetime.now(timezone.utc).isoformat(timespec='seconds')}] "
                         f"[{completed}/{len(work_items)}] "
                         f"{item_id[:24]} {status}"
                     )

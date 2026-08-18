@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import redirect_stdout
+from datetime import datetime, timezone
 import io
 import json
 import unittest
@@ -377,6 +378,7 @@ class PipelineTests(unittest.TestCase):
             lines = (TEST_TMP / "ashaar_sft.jsonl").read_text("utf-8").splitlines()
             self.assertEqual([json.loads(line) for line in lines], [record])
 
+        stdout = io.StringIO()
         with (
             patch("ai_poet.synthetic_data.runner.load_poems", return_value=[poem]),
             patch("ai_poet.synthetic_data.runner.file_sha256", return_value="source-digest"),
@@ -385,9 +387,19 @@ class PipelineTests(unittest.TestCase):
                 "ai_poet.synthetic_data.runner.write_outputs",
                 side_effect=assert_live_jsonl,
             ),
-            redirect_stdout(io.StringIO()),
+            patch("ai_poet.synthetic_data.runner.datetime") as clock,
+            redirect_stdout(stdout),
         ):
+            clock.now.return_value = datetime(
+                2026, 8, 18, 14, 23, 5, tzinfo=timezone.utc
+            )
             self.assertEqual(run(run_settings), 0)
+
+        clock.now.assert_called_once_with(timezone.utc)
+        self.assertIn(
+            f"[2026-08-18T14:23:05+00:00] [1/1] {poem.sample_id[:24]} ok",
+            stdout.getvalue(),
+        )
 
     def test_run_regenerates_legacy_checkpoint_success(self) -> None:
         poem = make_poem()

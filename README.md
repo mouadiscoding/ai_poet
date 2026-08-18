@@ -335,7 +335,9 @@ three times without consuming a candidate-repair attempt.
 
 Each successful record is also appended and flushed immediately to
 `ashaar_sft.jsonl`, so the training data can be inspected while generation is
-still running. The file is rewritten in source order when the run finishes.
+still running. Each terminal progress line prints a UTC timestamp beside the
+generated-record count. The file is rewritten in source order when the run
+finishes.
 
 The run returns a non-zero exit status while any selected poem remains
 unresolved. `failures.jsonl` is updated during the run and records a stable
