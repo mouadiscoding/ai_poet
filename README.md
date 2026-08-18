@@ -6,8 +6,9 @@ This project builds Arabic supervised fine-tuning datasets from
 - `poem-generation` reverse-constructs a writing instruction and editorial
   worklog, then appends the trusted source poem.
 - `poem-completion` adds a reproducibly selected complete-couplet beginning to
-  the same detailed writing instruction and full editorial worklog. Gemma does
-  not generate the consolidated final poem; Python appends the trusted source.
+  the same detailed writing instruction. Its editorial worklog covers only the
+  missing couplets; Gemma does not generate the consolidated final poem, and
+  Python appends the trusted source.
 - `mcq` applies meter, theme, and title question templates to each poem. Each
   template has multiple uniformly selected question phrasings; the stored
   metadata is supplied as the exact ground-truth answer, and a template is
@@ -287,8 +288,9 @@ thoughts.
 For poem completion, the beginning ends at a complete-couplet boundary selected
 uniformly by a local RNG seeded from the task version and poem hash. The same
 poem therefore receives the same beginning across retries and reruns. Gemma
-returns only the validated instruction and structured editorial work; Python
-owns the single exact full-poem section at the end of the assistant response.
+returns only the validated instruction and structured editorial work for the
+new couplets, using the final provided couplet as context. Python owns the
+single exact full-poem section at the end of the assistant response.
 
 ## Tests
 

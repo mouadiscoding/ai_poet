@@ -178,7 +178,10 @@ def _build_poem_generation_fixture_bank(
                 total_couplets=poem.couplet_count,
                 provided_couplets=provided,
             )
-        start_offset = (index * 3) % len(couplets)
+            target_starts = list(range(provided, len(couplets), 3))
+            start_offset = target_starts[index % len(target_starts)]
+        else:
+            start_offset = (index * 3) % len(couplets)
         chunk = couplets[start_offset : start_offset + 3]
         messages = build_reasoning_messages(
             instruction=reasoning_instruction,
@@ -211,13 +214,19 @@ def _build_poem_generation_fixture_bank(
             )
         )
 
+    validation_candidate = example_reasoning["response"]
     validation_targets = [
         block["revised_draft"]
-        for block in example_reasoning["response"]["verse_reasoning"]
+        for block in validation_candidate["verse_reasoning"]
     ]
     validation_instruction = example_reasoning["instruction"]
     if completion:
         example_couplets = example_reasoning["poem"].splitlines()
+        validation_candidate = {
+            "overview": validation_candidate["overview"],
+            "verse_reasoning": validation_candidate["verse_reasoning"][1:],
+        }
+        validation_targets = validation_targets[1:]
         validation_instruction = compose_completion_instruction(
             validation_instruction,
             beginning=example_couplets[0],
@@ -229,7 +238,7 @@ def _build_poem_generation_fixture_bank(
             instruction=validation_instruction,
             meter_name=example_reasoning["meter_name"],
             expected_couplets=validation_targets,
-            candidate=example_reasoning["response"],
+            candidate=validation_candidate,
         )
     )
     fixtures.extend(

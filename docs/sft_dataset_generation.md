@@ -23,10 +23,10 @@ checkpointing, splits, and exporters:
 
 - `poem-completion` augments the poem-generation instruction with a complete-
   couplet prefix chosen uniformly by a local RNG seeded from the task version
-  and poem hash. It retains whole-poem editorial reasoning. Gemma never emits
-  the consolidated final poem; Python appends the exact complete source poem.
-  Poems with only one couplet are skipped because no complete-couplet suffix
-  would remain.
+  and poem hash. Its editorial reasoning covers only the missing couplets and
+  uses the supplied beginning as context. Gemma never emits the consolidated
+  final poem; Python appends the exact complete source poem. Poems with only
+  one couplet are skipped because no complete-couplet suffix would remain.
 - `mcq` applies templates for `poem_meter`, `poem_theme`, and `poem_title`.
   Each template contains multiple Arabic question phrasings, one of which is
   chosen uniformly with a deterministic per-poem seed. The stored metadata
@@ -227,9 +227,10 @@ re-diacritize, or hallucinate the final target.
 For poem completion, the validated instruction is augmented deterministically
 with `بداية القصيدة:` and `مهمة الإكمال:` sections. These contain the exact
 prefix plus the total, provided, and remaining couplet counts. Reasoning still
-covers every couplet, including the supplied beginning. The endpoint is asked
-only for structured reasoning chunks; the same Python renderer appends the
-trusted complete source poem.
+covers every missing couplet with its original full-poem index. Supplied
+couplets are context only and receive no editorial blocks. The endpoint is
+asked only for structured reasoning chunks; the same Python renderer appends
+the trusted complete source poem.
 
 ## Poem-size controls
 
@@ -604,8 +605,9 @@ It covers:
 - JSON and fenced-JSON extraction.
 - Strict Gemma verdict parsing, rejection feedback, and repair.
 - Exact source-poem preservation.
-- Seeded complete-couplet completion prefixes, one-couplet filtering, full-
-  poem reasoning, generic stage resume, and Python-owned exact final poems.
+- Seeded complete-couplet completion prefixes, one-couplet filtering,
+  continuation-only reasoning, generic stage resume, and Python-owned exact
+  final poems.
 - Oversized-poem summaries and synthesis.
 - Template-version-aware checkpoint reuse.
 - JSONL and Parquet round trips.

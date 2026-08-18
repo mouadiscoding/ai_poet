@@ -21,7 +21,7 @@ from ..prompts.templates import (
 from .base import TASK_POEM_COMPLETION, TaskWorkflow
 
 
-TASK_VERSION = 1
+TASK_VERSION = 2
 PREFIX_POLICY = "seeded-uniform-complete-couplet-v1"
 
 
@@ -107,6 +107,7 @@ def generate_one(
             "provided_couplet_count": provided,
             "remaining_couplet_count": remaining,
         },
+        reasoning_start_offset=provided,
         generation_fingerprint=generation_fingerprint,
         resume_instruction=resume_instruction,
         resume_chunks=resume_chunks,
@@ -118,7 +119,8 @@ def generate_one(
 
 
 def estimate_work(poem: PoemRecord, _run_settings: Any) -> int:
-    return 2 + 2 * math.ceil(poem.couplet_count / 3)
+    remaining = poem.couplet_count - provided_couplet_count(poem)
+    return 2 + 2 * math.ceil(remaining / 3)
 
 
 def contract_settings(settings: Any) -> dict[str, Any]:

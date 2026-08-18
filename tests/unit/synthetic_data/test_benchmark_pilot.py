@@ -124,7 +124,12 @@ class BenchmarkAndPilotTests(unittest.TestCase):
             for fixture in completion_fixtures
             if fixture.request_kind == "reasoning_generation"
         )
-        self.assertIn("بداية القصيدة:", completion_reasoning.messages[-1]["content"])
+        completion_prompt = completion_reasoning.messages[-1]["content"]
+        self.assertIn("بداية القصيدة:", completion_prompt)
+        self.assertIn(f"2. {poems[0].poem_text.splitlines()[1]}", completion_prompt)
+        self.assertNotIn(
+            f"1. {poems[0].poem_text.splitlines()[0]}", completion_prompt
+        )
         self.assertEqual(
             sum(
                 fixture.request_kind == "reconstruction_validation"

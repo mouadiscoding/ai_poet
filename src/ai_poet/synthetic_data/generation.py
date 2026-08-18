@@ -250,6 +250,7 @@ def _generate_reasoning_chunk(
     all_couplets: Sequence[str],
     start_offset: int,
     chunk_couplets: Sequence[str],
+    include_overview: bool,
     seed: int,
 ) -> tuple[str | None, list[dict[str, Any]], int]:
     """Generate and independently validate one bounded verse-work chunk."""
@@ -257,7 +258,6 @@ def _generate_reasoning_chunk(
     expected_indices = list(
         range(start_index, start_index + len(chunk_couplets))
     )
-    include_overview = start_offset == 0
     base_messages = build_reasoning_messages(
         instruction=instruction,
         meter_name=poem.meter_name,
@@ -418,6 +418,7 @@ def generate_poem_writing_record(
     task_version: int,
     instruction_augmenter: Callable[[str], str] | None = None,
     record_metadata: dict[str, Any] | None = None,
+    reasoning_start_offset: int = 0,
     generation_fingerprint: str = "legacy",
     resume_instruction: dict[str, Any] | None = None,
     resume_chunks: dict[int, dict[str, Any]] | None = None,
@@ -553,7 +554,15 @@ def generate_poem_writing_record(
         )
 
     all_couplets = poem.poem_text.splitlines()
-    starts = list(range(0, len(all_couplets), REASONING_CHUNK_COUPLETS))
+    if not 0 <= reasoning_start_offset < len(all_couplets):
+        raise ValueError("reasoning start offset must identify a source couplet")
+    starts = list(
+        range(
+            reasoning_start_offset,
+            len(all_couplets),
+            REASONING_CHUNK_COUPLETS,
+        )
+    )
     chunk_results: dict[int, tuple[str | None, list[dict[str, Any]], int]] = {}
     missing_jobs: list[
         tuple[int, Callable[[], tuple[str | None, list[dict[str, Any]], int]]]
@@ -587,6 +596,7 @@ def generate_poem_writing_record(
                 all_couplets=all_couplets,
                 start_offset=start_offset,
                 chunk_couplets=chunk_couplets,
+                include_overview=start_offset == reasoning_start_offset,
                 seed=seed,
             )
             if checkpoint_writer is not None:
@@ -632,9 +642,11 @@ def generate_poem_writing_record(
     if overview is None:
         raise GenerationError("first reasoning chunk did not produce an overview")
     if [block["verse_index"] for block in all_blocks] != list(
-        range(1, poem.couplet_count + 1)
+        range(reasoning_start_offset + 1, poem.couplet_count + 1)
     ):
-        raise GenerationError("assembled reasoning does not cover every couplet once")
+        raise GenerationError(
+            "assembled reasoning does not cover every target couplet once"
+        )
 
     editorial_reasoning = render_reasoning(
         overview,

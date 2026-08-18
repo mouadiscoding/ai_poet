@@ -159,12 +159,21 @@ def build_reasoning_messages(
         context_lines.append(f"البيت التالي للسياق فقط: {next_couplet}")
     context = "\n".join(context_lines) or "لا توجد أبيات مجاورة خارج هذه الدفعة."
 
-    overview_contract = (
-        'أخرج المفتاحين "overview" و"verse_reasoning". اجعل overview خطة '
-        "موجزة تربط القصيدة كلها، لا وصفًا لكيفية تحليلها."
-        if include_overview
-        else 'أخرج المفتاح "verse_reasoning" وحده، ولا تكرر overview.'
-    )
+    if include_overview and start_index == 1:
+        overview_contract = (
+            'أخرج المفتاحين "overview" و"verse_reasoning". اجعل overview خطة '
+            "موجزة تربط القصيدة كلها، لا وصفًا لكيفية تحليلها."
+        )
+    elif include_overview:
+        overview_contract = (
+            'أخرج المفتاحين "overview" و"verse_reasoning". اجعل overview خطة '
+            "موجزة لإكمال القصيدة تربط الأبيات المستهدفة بالبداية المعطاة، لا "
+            "سجلًا لتحرير الأبيات السابقة ولا وصفًا لكيفية تحليلها."
+        )
+    else:
+        overview_contract = (
+            'أخرج المفتاح "verse_reasoning" وحده، ولا تكرر overview.'
+        )
     form_check = (
         "في حقلي فحص الشطرين راجع الإيقاع الداخلي والتوازي والوقفات؛ لا تخترع تفعيلات."
         if meter_name == "النثر"

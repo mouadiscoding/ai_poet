@@ -46,7 +46,8 @@ from tests.synthetic_data_helpers import (
     make_poem,
     remove_test_files,
     settings,
-    valid_pipeline_outputs,
+    valid_instruction_value,
+    valid_reasoning_value,
     valid_verdict,
 )
 
@@ -118,6 +119,32 @@ def valid_reconstruction_candidate():
     }
 
 
+def valid_completion_pipeline_outputs(poem) -> list[str]:
+    provided = provided_couplet_count(poem)
+    outputs = [
+        json.dumps(valid_instruction_value(poem), ensure_ascii=False),
+        json.dumps(valid_verdict(), ensure_ascii=False),
+    ]
+    for start_offset in range(provided, poem.couplet_count, 3):
+        reasoning = valid_reasoning_value(
+            poem,
+            start_offset=start_offset,
+            chunk_size=3,
+        )
+        if start_offset == provided:
+            reasoning["overview"] = (
+                "أصل الأبيات الجديدة بالبداية المعطاة، وأتابع انتقال المعنى نحو "
+                "الرجاء من غير إنشاء سجل تحريري للأبيات السابقة."
+            )
+        outputs.extend(
+            [
+                json.dumps(reasoning, ensure_ascii=False),
+                json.dumps(valid_verdict(), ensure_ascii=False),
+            ]
+        )
+    return outputs
+
+
 class TaskRegistryTests(unittest.TestCase):
     def test_registry_and_default_directories(self) -> None:
         self.assertEqual(
@@ -125,7 +152,7 @@ class TaskRegistryTests(unittest.TestCase):
             TASK_POEM_GENERATION,
         )
         self.assertEqual(get_task_workflow(TASK_MCQ).version, 3)
-        self.assertEqual(get_task_workflow(TASK_POEM_COMPLETION).version, 1)
+        self.assertEqual(get_task_workflow(TASK_POEM_COMPLETION).version, 2)
         self.assertEqual(get_task_workflow(TASK_POEM_RECONSTRUCTION).version, 2)
         self.assertEqual(default_output_dir(TASK_MCQ), Path("data/ashaar_mcq_sft"))
         self.assertEqual(
@@ -271,11 +298,11 @@ class CompletionWorkflowTests(unittest.TestCase):
 
     def test_generation_adds_prefix_and_python_owned_exact_final_poem(self) -> None:
         poem = make_poem()
-        client = QueueClient(valid_pipeline_outputs(poem))
+        client = QueueClient(valid_completion_pipeline_outputs(poem))
         record = generate_completion(poem, client, settings())
 
         self.assertEqual(record["task_type"], TASK_POEM_COMPLETION)
-        self.assertEqual(record["task_version"], 1)
+        self.assertEqual(record["task_version"], 2)
         self.assertEqual(
             record["record_id"], f"{TASK_POEM_COMPLETION}:{poem.sample_id}"
         )
@@ -287,10 +314,23 @@ class CompletionWorkflowTests(unittest.TestCase):
         self.assertIn("عدد أبيات القصيدة كاملة: 2", record["instruction"])
         self.assertIn("عدد الأبيات المعطاة أعلاه: 1", record["instruction"])
         self.assertIn("عدد الأبيات المطلوب إضافتها: 1", record["instruction"])
-        self.assertIn("البيت 1:", record["response"])
+        self.assertNotIn("البيت 1:", record["response"])
         self.assertIn("البيت 2:", record["response"])
+        self.assertEqual(record["reasoning_chunk_count"], 1)
         self.assertEqual(record["response"].count("النتيجة النهائية:"), 1)
         self.assertTrue(record["response"].endswith(poem.poem_text))
+        reasoning_prompt = client.calls[2][-1]["content"]
+        self.assertIn(
+            f"البيت السابق للسياق فقط: {poem.poem_text.splitlines()[0]}",
+            reasoning_prompt,
+        )
+        self.assertIn(
+            f"2. {poem.poem_text.splitlines()[1]}", reasoning_prompt
+        )
+        self.assertNotIn(
+            f"1. {poem.poem_text.splitlines()[0]}", reasoning_prompt
+        )
+        self.assertIn("لا سجلًا لتحرير الأبيات السابقة", reasoning_prompt)
         self.assertEqual(
             [kwargs["trace_context"]["request_kind"] for kwargs in client.call_kwargs],
             [
@@ -310,7 +350,7 @@ class CompletionWorkflowTests(unittest.TestCase):
         path = TEST_TMP / name
         first = generate_completion(
             poem,
-            QueueClient(valid_pipeline_outputs(poem)),
+            QueueClient(valid_completion_pipeline_outputs(poem)),
             settings(),
             generation_fingerprint="completion-fingerprint",
             checkpoint_writer=CheckpointWriter(path),
@@ -327,6 +367,33 @@ class CompletionWorkflowTests(unittest.TestCase):
         self.assertFalse(client.calls)
         self.assertEqual(resumed["instruction"], first["instruction"])
         self.assertEqual(resumed["response"], first["response"])
+
+    def test_long_completion_reasons_over_every_missing_couplet_once(self) -> None:
+        poem = make_poem(
+            verses=tuple(
+                part
+                for couplet in range(1, 9)
+                for part in (
+                    f"صدر البيت {couplet}",
+                    f"عجز البيت {couplet}",
+                )
+            )
+        )
+        provided = provided_couplet_count(poem)
+        record = generate_completion(
+            poem,
+            QueueClient(valid_completion_pipeline_outputs(poem)),
+            settings(),
+        )
+
+        for index in range(1, provided + 1):
+            self.assertNotIn(f"البيت {index}:", record["response"])
+        for index in range(provided + 1, poem.couplet_count + 1):
+            self.assertEqual(record["response"].count(f"البيت {index}:"), 1)
+        self.assertEqual(
+            record["reasoning_chunk_count"],
+            (record["remaining_couplet_count"] + 2) // 3,
+        )
 
     def test_runner_enforces_completion_eligibility_and_source_bound(self) -> None:
         one_couplet = make_poem(verses=("صدر وحيد", "عجز وحيد"))
@@ -386,7 +453,7 @@ class CompletionWorkflowTests(unittest.TestCase):
             {},
             settings(),
             task_type=TASK_POEM_COMPLETION,
-            task_version=1,
+            task_version=2,
         )
         manifest = json.loads((TEST_TMP / "manifest.json").read_text("utf-8"))
         self.assertEqual(manifest["template_version"], TEMPLATE_VERSION)
