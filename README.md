@@ -113,6 +113,41 @@ exactly one endpoint-mode sequence below.
 | Three endpoints, standard safeguards | Yes | Yes | `--capacity-report`, `--pilot-report`, and `--pilot-review` |
 | Three endpoints, safeguards skipped | No | No | `--skip-pilot-review` |
 
+<details>
+<summary><strong>All generation arguments</strong></summary>
+
+Run `just generate-help` at any time to see the underlying CLI help. Arguments
+listed here can be appended to the appropriate generation recipe after its
+task and other positional recipe parameters.
+
+| Argument | Default | Meaning |
+| --- | --- | --- |
+| `-h`, `--help` | — | Print the generator's help and exit. |
+| `--input PATH` | `data/ashaar_classic_moroccan.parquet` | Source-poem Parquet file. See the custom-dataset section below for its schema. |
+| `--task TASK` | `poem-generation` | Select `poem-generation`, `poem-completion`, `mcq`, or `poem-reconstruction`. Just recipes accept this as their first positional argument. |
+| `--output-dir PATH` | Task-specific | Directory for SFT records, checkpoints, failures, metrics, and the manifest. Defaults to `data/ashaar_sft`, `data/ashaar_completion_sft`, `data/ashaar_mcq_sft`, or `data/ashaar_reconstruction_sft`, according to the task. |
+| `--insecure` | Off | Disable TLS certificate verification. The provided network-facing Just recipes enable this; use them only with trusted internal endpoints. |
+| `--concurrency N` | `4` | Number of concurrent sample workers in one-endpoint mode; must be at least 1. Three-endpoint concurrency comes from the capacity plan instead. |
+| `--timeout SECONDS` | `300.0` | Timeout for each endpoint request. |
+| `--max-network-retries N` | `3` | Maximum network retries; cannot be negative. |
+| `--max-repairs N` | `5` | Maximum candidate-repair attempts after an initial invalid generation. |
+| `--temperature FLOAT` | `0.4` | Sampling temperature for generation requests. Validation requests use their fixed task settings. |
+| `--top-p FLOAT` | `0.9` | Nucleus-sampling probability passed to the endpoint. |
+| `--max-tokens N` | `4096` | Maximum completion-token budget for generation requests unless a task stage uses a smaller fixed budget. |
+| `--min-chars N` | `1500` | Minimum instruction length requested and validated by instruction-generating tasks. |
+| `--max-source-chars N` | `24000` | Complete-poem size threshold. Poem generation summarizes oversized source chunks; completion, MCQ, and reconstruction reject selected poems above the threshold. |
+| `--chunk-chars N` | `12000` | Preferred character limit for couplet-aligned chunks when analyzing an oversized poem. |
+| `--max-couplets N` | `24` | Exclude longer poems before applying `--limit`; must be at least 1. |
+| `--limit N` | No limit | Process only the first N eligible source poems; must be at least 1. For MCQ this counts poems, not emitted records. |
+| `--capacity-report PATH` | None | Certified `endpoint_capacity.json`. Required for safeguarded three-endpoint generation. |
+| `--pilot-report PATH` | None | Passing `pilot_report.json` for the same source, task, settings, and capacity report. Required by the standard three-endpoint gate. |
+| `--pilot-review PATH` | None | Completed human `pilot_review.json` corresponding to the pilot report. Required by the standard three-endpoint gate. |
+| `--skip-pilot-review` | Off | Bypass capacity certification and both pilot artifacts in three-endpoint mode. This emits a warning and uses configured endpoint concurrency limits. |
+| `--per-sample-chunk-cap N` | `4` | Maximum number of chunks from one poem that may run concurrently; must be at least 1. |
+| `--trace` | Off | Print full audit events and append them to `OUTPUT_DIR/generation_trace.jsonl`. |
+
+</details>
+
 ### Using a different source dataset
 
 Pass `--input` to any generation recipe to replace the default
